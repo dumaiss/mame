@@ -3,8 +3,7 @@
 
     pbitz.lst
 
-    List of all enabled drivers for compile target. This is not an automatically
-    generated file, and it should be manually updated when a new driver is added.
+    List of pBITz experimental drivers.
 
 *******************************************************************************/
 

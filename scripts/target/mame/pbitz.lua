@@ -39,6 +39,14 @@ function createProjects_mame_pbitz(_target, _subtarget)
 
 	files {
 		MAME_DIR .. "src/mame/pbitz/coffeez80.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.h",
+		MAME_DIR .. "src/mame/pbitz/pbitz_serial.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_serial.h",
+		MAME_DIR .. "src/mame/pbitz/pbitz_zsio.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_zsio.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr_banktst.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr_siotop.cpp",
 	}
 end
 
