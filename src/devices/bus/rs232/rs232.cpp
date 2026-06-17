@@ -154,6 +154,10 @@ device_rs232_port_interface::~device_rs232_port_interface()
 }
 
 
+#ifdef PBITZ_RS232_MINIMAL
+#include "loopback.h"
+#include "pty.h"
+#else
 #include "ie15.h"
 #include "heath_h19.h"
 #include "hlemouse.h"
@@ -171,12 +175,17 @@ device_rs232_port_interface::~device_rs232_port_interface()
 #include "swtpc8212.h"
 #include "terminal.h"
 #include "votraxtnt.h"
+#endif
 
 template class device_finder<device_rs232_port_interface, false>;
 template class device_finder<device_rs232_port_interface, true>;
 
 void default_rs232_devices(device_slot_interface &device)
 {
+#ifdef PBITZ_RS232_MINIMAL
+	device.option_add("loopback",      RS232_LOOPBACK);
+	device.option_add("pty",           PSEUDO_TERMINAL);
+#else
 	device.option_add("dec_loopback",  DEC_RS232_LOOPBACK);
 	device.option_add("h19",           SERIAL_TERMINAL_H19);
 	device.option_add("ie15",          SERIAL_TERMINAL_IE15);
@@ -196,4 +205,5 @@ void default_rs232_devices(device_slot_interface &device)
 	device.option_add("swtpc8212",     SERIAL_TERMINAL_SWTPC8212);
 	device.option_add("terminal",      SERIAL_TERMINAL);
 	device.option_add("votraxtnt",     SERIAL_VOTRAXTNT);
+#endif
 }

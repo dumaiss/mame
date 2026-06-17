@@ -77,6 +77,12 @@ void pseudo_terminal_device::device_start()
 	m_timer_poll = timer_alloc(FUNC(pseudo_terminal_device::update_queue), this);
 
 	open();
+#ifdef PBITZ_RS232_MINIMAL
+	if (is_open())
+		osd_printf_info("%s: pseudo terminal slave %s\n", tag(), slave_name().c_str());
+	else
+		osd_printf_info("%s: pseudo terminal open failed\n", tag());
+#endif
 }
 
 void pseudo_terminal_device::device_stop()

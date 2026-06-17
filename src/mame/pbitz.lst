@@ -16,3 +16,6 @@ zephyr_banktst
 
 @source:pbitz/zephyr_siotop.cpp
 zephyr_siotop
+
+@source:pbitz/zephyr80.cpp
+zephyr80

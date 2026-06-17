@@ -514,6 +514,8 @@ public:
 
 	void rxa_w(int state) { m_chanA->write_rx(state); }
 	void rxb_w(int state) { m_chanB->write_rx(state); }
+	void rxa_byte_w(uint8_t data) { m_chanA->queue_received(data, 0); }
+	void rxb_byte_w(uint8_t data) { m_chanB->queue_received(data, 0); }
 	void ctsa_w(int state) { m_chanA->cts_w(state); }
 	void ctsb_w(int state) { m_chanB->cts_w(state); }
 	void dcda_w(int state) { m_chanA->dcd_w(state); }

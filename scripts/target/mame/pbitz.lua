@@ -19,6 +19,10 @@ function createProjects_mame_pbitz(_target, _subtarget)
 	uuid (os.uuid("drv-mame-pbitz"))
 	addprojectflags()
 
+	defines {
+		"PBITZ_RS232_MINIMAL",
+	}
+
 	includedirs {
 		MAME_DIR .. "src/osd",
 		MAME_DIR .. "src/emu",
@@ -38,13 +42,25 @@ function createProjects_mame_pbitz(_target, _subtarget)
 	}
 
 	files {
+		MAME_DIR .. "src/devices/bus/rs232/loopback.cpp",
+		MAME_DIR .. "src/devices/bus/rs232/loopback.h",
+		MAME_DIR .. "src/devices/bus/rs232/pty.cpp",
+		MAME_DIR .. "src/devices/bus/rs232/pty.h",
+		MAME_DIR .. "src/devices/bus/rs232/rs232.cpp",
+		MAME_DIR .. "src/devices/bus/rs232/rs232.h",
+		MAME_DIR .. "src/devices/machine/z80sio.cpp",
+		MAME_DIR .. "src/devices/machine/z80sio.h",
 		MAME_DIR .. "src/mame/pbitz/coffeez80.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_coffeeio.cpp",
+		MAME_DIR .. "src/mame/pbitz/pbitz_coffeeio.h",
 		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.cpp",
 		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.h",
 		MAME_DIR .. "src/mame/pbitz/pbitz_serial.cpp",
 		MAME_DIR .. "src/mame/pbitz/pbitz_serial.h",
 		MAME_DIR .. "src/mame/pbitz/pbitz_zsio.cpp",
 		MAME_DIR .. "src/mame/pbitz/pbitz_zsio.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_map.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr_banktst.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr_siotop.cpp",
 	}
