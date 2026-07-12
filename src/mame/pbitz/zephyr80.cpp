@@ -14,6 +14,9 @@
 #include "machine/z80ctc.h"
 #include "machine/z80daisy.h"
 #include "machine/z80sio.h"
+#include "video/v9938.h"
+
+#include "screen.h"
 
 #include <array>
 
@@ -42,6 +45,7 @@ public:
 		, m_sio0(*this, "sio0")
 		, m_sio1(*this, "sio1")
 		, m_ctc(*this, "ctc")
+		, m_vdp(*this, "vdp")
 		, m_coffeeio(*this, "coffeeio")
 		, m_rom_region(*this, "maincpu")
 	{
@@ -58,6 +62,7 @@ private:
 	required_device<z80sio_device> m_sio0;
 	required_device<z80sio_device> m_sio1;
 	required_device<z80ctc_device> m_ctc;
+	required_device<v9958_device> m_vdp;
 	required_device<pbitz_coffeeio_device> m_coffeeio;
 	required_memory_region m_rom_region;
 
@@ -156,8 +161,13 @@ void zephyr80_state::io_map(address_map &map)
 	// (CTC0_CTRL..CTC3_CTRL = $40..$43).
 	map(io::CTC_START, io::CTC_START + io::CTC_REGISTER_MASK).mirror(io::CTC_REGISTER_MIRROR).rw(m_ctc, FUNC(z80ctc_device::read), FUNC(z80ctc_device::write));
 
+	// IO_DECODER.pld: V9958 VDP at $a0-$bf.  A1:A0 select the four V9958 ports:
+	// +0 VRAM data, +1 command/status, +2 palette, +3 register (read: +0 VRAM,
+	// +1 status).
+	map(io::VDP_START, io::VDP_START + io::VDP_REGISTER_MASK).mirror(io::VDP_REGISTER_MIRROR).rw(m_vdp, FUNC(v9958_device::read), FUNC(v9958_device::write));
+
 	// Reserved by IO_DECODER.pld for future phases:
-	// $60-$6f cartridge I/O, $a0-$bf VDP,
+	// $60-$6f cartridge I/O,
 	// $e0-$ff SOUND on write and CTRL on read.
 }
 
@@ -411,6 +421,18 @@ void zephyr80_state::zephyr80(machine_config &config)
 	m_ctc->intr_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
 	m_ctc->zc_callback<0>().set(m_sio0, FUNC(z80sio_device::rxca_w));
 	m_ctc->zc_callback<0>().append(m_sio0, FUNC(z80sio_device::txca_w));
+
+	// V9958 video card at $a0-$bf, driven directly by CP/M/BIOS I/O.  The card's
+	// /INT is wired to the CPU maskable interrupt: it is not part of the Z80 IM2
+	// daisy chain, so on interrupt-acknowledge the (pulled-high) data bus returns
+	// $ff -- the Z80 core reproduces this by falling back to the default vector
+	// when no daisy device is the source, giving IM2 vector $ff (I:$ff).
+	V9958(config, m_vdp, 21.477272_MHz_XTAL);
+	m_vdp->set_screen_ntsc("screen");
+	m_vdp->set_vram_size(0x20000); // 128 KiB
+	m_vdp->int_cb().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+
+	SCREEN(config, "screen", SCREEN_TYPE_RASTER);
 
 	PBITZ_COFFEEIO(config, m_coffeeio);
 	m_coffeeio->response_a_callback().set(FUNC(zephyr80_state::coffeeio_a_response_w));

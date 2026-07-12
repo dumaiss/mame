@@ -48,6 +48,10 @@ static constexpr u8 SIO_CHAN_B_CONTROL = 0x03;
 // Z80CTC channels select on A1:A0 within the $40-$4f block.
 static constexpr u8 CTC_REGISTER_MASK = 0x03;
 static constexpr u8 CTC_REGISTER_MIRROR = 0x0c;
+
+// V9958 ports select on A1:A0 within the $a0-$bf block (A2-A4 mirrored).
+static constexpr u8 VDP_REGISTER_MASK = 0x03;
+static constexpr u8 VDP_REGISTER_MIRROR = 0x1c;
 } // namespace io
 
 // Memory regions derived from MEM_DECODER.pld (Rev 09).
