@@ -11,6 +11,8 @@
 #include "bus/rs232/rs232.h"
 #include "cpu/z80/z80.h"
 #include "machine/clock.h"
+#include "machine/z80ctc.h"
+#include "machine/z80daisy.h"
 #include "machine/z80sio.h"
 
 #include <array>
@@ -24,6 +26,13 @@ void pbitz_rs232_devices(device_slot_interface &device)
 	device.option_add("loopback", RS232_LOOPBACK);
 }
 
+// The SIO0/B console link runs at a fixed 115200 8N1 in hardware, so default any
+// device attached to that port to 115200 (matching the SIO channel B clock).
+static DEVICE_INPUT_DEFAULTS_START(console_baud_115200)
+	DEVICE_INPUT_DEFAULTS("RS232_TXBAUD", 0xff, RS232_BAUD_115200)
+	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_115200)
+DEVICE_INPUT_DEFAULTS_END
+
 class zephyr80_state : public driver_device
 {
 public:
@@ -32,6 +41,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_sio0(*this, "sio0")
 		, m_sio1(*this, "sio1")
+		, m_ctc(*this, "ctc")
 		, m_coffeeio(*this, "coffeeio")
 		, m_rom_region(*this, "maincpu")
 	{
@@ -47,6 +57,7 @@ private:
 	required_device<z80_device> m_maincpu;
 	required_device<z80sio_device> m_sio0;
 	required_device<z80sio_device> m_sio1;
+	required_device<z80ctc_device> m_ctc;
 	required_device<pbitz_coffeeio_device> m_coffeeio;
 	required_memory_region m_rom_region;
 
@@ -55,10 +66,6 @@ private:
 
 	std::unique_ptr<u8[]> m_ram;
 	u8 m_latch = 0;
-	bool m_cart_detect = false;
-	bool m_prog = false;
-	bool m_sio0_irq = false;
-	bool m_sio1_irq = false;
 	bool m_sio_tx_line_start[4] = { };
 	std::array<u8, COFFEEIO_RX_QUEUE_SIZE> m_coffeeio_rx_queue = { };
 	u8 m_coffeeio_rx_head = 0;
@@ -78,22 +85,18 @@ private:
 	void sio0_w(offs_t offset, u8 data);
 	u8 sio1_r(offs_t offset);
 	void sio1_w(offs_t offset, u8 data);
-	void sio0_irq_w(int state);
-	void sio1_irq_w(int state);
-	void update_irq();
 	void log_sio_tx(unsigned channel, const char *prefix, u8 data);
 	void coffeeio_a_response_w(u8 data);
 	void coffeeio_start_rx();
 	TIMER_CALLBACK_MEMBER(coffeeio_rx_tick);
 
 	bool bios_range(offs_t offset) const;
-	bool common_ram(offs_t offset) const;
-	bool ram_only(offs_t offset) const;
-	bool upper_32k(offs_t offset) const;
+	bool safe_ram(offs_t offset) const;
 	bool ram_shadow() const;
 	bool rom_disabled() const;
-	bool all_ram_mode() const;
+	u8 rom_page() const;
 	u8 selected_ram_bank(offs_t offset) const;
+	u8 rom_r(offs_t offset) const;
 	u8 ram_r(offs_t offset) const;
 	void ram_w(offs_t offset, u8 data);
 };
@@ -106,10 +109,6 @@ void zephyr80_state::machine_start()
 
 	save_pointer(NAME(m_ram), zephyr80_map::mem::RAM_SIZE);
 	save_item(NAME(m_latch));
-	save_item(NAME(m_cart_detect));
-	save_item(NAME(m_prog));
-	save_item(NAME(m_sio0_irq));
-	save_item(NAME(m_sio1_irq));
 	save_item(NAME(m_sio_tx_line_start));
 	save_item(NAME(m_coffeeio_rx_queue));
 	save_item(NAME(m_coffeeio_rx_head));
@@ -120,11 +119,7 @@ void zephyr80_state::machine_start()
 
 void zephyr80_state::machine_reset()
 {
-	m_latch = 0;
-	m_cart_detect = false; // No cartridge emulation in Phase 8.
-	m_prog = false;        // Programming mode is represented but not functional yet.
-	m_sio0_irq = false;
-	m_sio1_irq = false;
+	m_latch = 0; // Reset: normal ROM mode, ROM page 0, SRAM bank 0, shadow off.
 	for (bool &line_start : m_sio_tx_line_start)
 		line_start = true;
 	m_coffeeio_rx_head = 0;
@@ -134,7 +129,6 @@ void zephyr80_state::machine_reset()
 	m_coffeeio_rx_timer->adjust(attotime::never);
 	m_sio1->rxa_w(1);
 	m_sio1->rxb_w(1);
-	update_irq();
 }
 
 void zephyr80_state::mem_map(address_map &map)
@@ -151,52 +145,45 @@ void zephyr80_state::io_map(address_map &map)
 	// IO_DECODER.pld: $00-$0f is the memory banking latch read/write block.
 	map(io::MEMBANK_START, io::MEMBANK_END).rw(FUNC(zephyr80_state::mem_latch_r), FUNC(zephyr80_state::mem_latch_w));
 
-	// IO_DECODER.pld: SIO0 at $20-$2f and SIO1 at $30-$3f.  Phase 9 uses real
-	// MAME Z80SIO devices with cd_ba register order mirrored through each
-	// 16-byte PLD block: +0 A data, +1 B data, +2 A control, +3 B control.
+	// IO_DECODER.pld: SIO0 at $20-$2f and SIO1 at $30-$3f.  The firmware
+	// (platform_zephyr80.inc) addresses each SIO as ba_cd: A1 selects the
+	// channel and A0 selects data/control, giving +0 A data, +1 A control,
+	// +2 B data, +3 B control within each 4-byte window.
 	map(io::SIO0_START, io::SIO0_START + io::SIO_REGISTER_MASK).mirror(io::SIO_REGISTER_MIRROR).rw(FUNC(zephyr80_state::sio0_r), FUNC(zephyr80_state::sio0_w));
 	map(io::SIO1_START, io::SIO1_START + io::SIO_REGISTER_MASK).mirror(io::SIO_REGISTER_MIRROR).rw(FUNC(zephyr80_state::sio1_r), FUNC(zephyr80_state::sio1_w));
 
+	// IO_DECODER.pld: CTC at $40-$4f.  Channels 0-3 select on A1:A0
+	// (CTC0_CTRL..CTC3_CTRL = $40..$43).
+	map(io::CTC_START, io::CTC_START + io::CTC_REGISTER_MASK).mirror(io::CTC_REGISTER_MIRROR).rw(m_ctc, FUNC(z80ctc_device::read), FUNC(z80ctc_device::write));
+
 	// Reserved by IO_DECODER.pld for future phases:
-	// $40-$4f CTC, $60-$6f cartridge I/O, $a0-$bf VDP,
+	// $60-$6f cartridge I/O, $a0-$bf VDP,
 	// $e0-$ff SOUND on write and CTRL on read.
 }
 
 u8 zephyr80_state::mem_r(offs_t offset)
 {
-	// MEM_DECODER.pld read-side behavior:
-	// ROM_CS = !MREQ & (PROG # (RD & !ROM_DIS & (RAM_SHADOW # BIOS_RANGE)))
-	// CART_CS is represented but no cartridge backing exists yet.
-	// SRAM_CS for reads is active in RAM_ONLY, UPPER_32K without cartridge,
-	// and BIOS_RANGE when ROM_DIS exposes all-RAM mode.
-	bool const rom_cs = m_prog || (!rom_disabled() && (ram_shadow() || bios_range(offset)));
-	bool const cart_cs = !m_prog && upper_32k(offset) && m_cart_detect && !ram_shadow();
+	// MEM_DECODER.pld (Rev 09) read-side decode:
+	//   ROM_CS = !MREQ & RD & !ROM_DIS &
+	//            ((RAM_SHADOW & !SAFE_RAM) # (!RAM_SHADOW & (BIOS_RANGE # SAFE_RAM)))
+	// In normal mode ROM is visible in the BIOS window ($0000-$5FFF) and the
+	// high common window ($C000-$FFFF); in shadow/copy mode ROM covers
+	// $0000-$BFFF while the high 16K reads SRAM.  Everything not selecting ROM
+	// selects SRAM (the SRAM_CS read terms are the exact complement here), and
+	// ROM-disabled mode reads SRAM everywhere.
+	bool const rom_cs = !rom_disabled()
+		&& ((ram_shadow() && !safe_ram(offset))
+			|| (!ram_shadow() && (bios_range(offset) || safe_ram(offset))));
 
-	if (rom_cs)
-	{
-		u8 const *rom = m_rom_region->base();
-		u32 const rom_bytes = m_rom_region->bytes();
-		return (offset < rom_bytes) ? rom[offset] : 0xff;
-	}
-
-	if (cart_cs)
-		return 0xff;
-
-	if (!m_prog && !ram_shadow() && ((bios_range(offset) && rom_disabled()) || ram_only(offset) || (upper_32k(offset) && !m_cart_detect)))
-		return ram_r(offset);
-
-	return 0xff;
+	return rom_cs ? rom_r(offset) : ram_r(offset);
 }
 
 void zephyr80_state::mem_w(offs_t offset, u8 data)
 {
-	// MEM_DECODER.pld write-side SRAM_CS behavior:
-	// SRAM_CS = !MREQ & !PROG & (RAM_SHADOW & WR # !RAM_SHADOW &
-	//   (BIOS_RANGE & (WR # ROM_DIS) # RAM_ONLY # UPPER_32K & !CART_DETECT)).
-	bool const sram_cs = !m_prog && (ram_shadow() || (!ram_shadow() && (bios_range(offset) || ram_only(offset) || (upper_32k(offset) && !m_cart_detect))));
-
-	if (sram_cs)
-		ram_w(offset, data);
+	// MEM_DECODER.pld (Rev 09): SRAM_CS carries an unconditional WR term, so
+	// every CPU write lands in SRAM (ROM is never written).  selected_ram_bank
+	// applies the BANK_Q selection and the SAFE_RAM force-bank-0 common rule.
+	ram_w(offset, data);
 }
 
 u8 zephyr80_state::mem_latch_r()
@@ -206,14 +193,14 @@ u8 zephyr80_state::mem_latch_r()
 
 void zephyr80_state::mem_latch_w(u8 data)
 {
-	// Provisional Phase 8 latch layout:
-	// bit 0-2 BANK_Q0..2, bit 3 RAM_SHADOW, bit 4 ROM_DIS, bit 5-7 reserved.
+	// 74HC273 banking latch: D0-D2 SRAM bank, D3 RAM_SHADOW, D4 ROM_DIS,
+	// D5-D7 ROM page.  All eight bits are latched.
 	m_latch = data & zephyr80_map::latch::WRITABLE_MASK;
 }
 
 u8 zephyr80_state::sio0_r(offs_t offset)
 {
-	return m_sio0->cd_ba_r(offset & zephyr80_map::io::SIO_REGISTER_MASK);
+	return m_sio0->ba_cd_r(offset & zephyr80_map::io::SIO_REGISTER_MASK);
 }
 
 void zephyr80_state::sio0_w(offs_t offset, u8 data)
@@ -230,12 +217,12 @@ void zephyr80_state::sio0_w(offs_t offset, u8 data)
 		break;
 	}
 
-	m_sio0->cd_ba_w(sio_offset, data);
+	m_sio0->ba_cd_w(sio_offset, data);
 }
 
 u8 zephyr80_state::sio1_r(offs_t offset)
 {
-	return m_sio1->cd_ba_r(offset & zephyr80_map::io::SIO_REGISTER_MASK);
+	return m_sio1->ba_cd_r(offset & zephyr80_map::io::SIO_REGISTER_MASK);
 }
 
 void zephyr80_state::sio1_w(offs_t offset, u8 data)
@@ -253,27 +240,7 @@ void zephyr80_state::sio1_w(offs_t offset, u8 data)
 		break;
 	}
 
-	m_sio1->cd_ba_w(sio_offset, data);
-}
-
-void zephyr80_state::sio0_irq_w(int state)
-{
-	m_sio0_irq = bool(state);
-	update_irq();
-}
-
-void zephyr80_state::sio1_irq_w(int state)
-{
-	m_sio1_irq = bool(state);
-	update_irq();
-}
-
-void zephyr80_state::update_irq()
-{
-	// Phase 9 uses a simple wired-OR IRQ approximation.  The real SIO/CTC/Pio
-	// interrupt daisy chain can be added once the remaining Z80 peripherals are
-	// present in the Zephyr-80 machine.
-	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (m_sio0_irq || m_sio1_irq) ? ASSERT_LINE : CLEAR_LINE);
+	m_sio1->ba_cd_w(sio_offset, data);
 }
 
 void zephyr80_state::log_sio_tx(unsigned channel, const char *prefix, u8 data)
@@ -338,19 +305,10 @@ bool zephyr80_state::bios_range(offs_t offset) const
 	return offset <= zephyr80_map::mem::BIOS_RANGE_END;
 }
 
-bool zephyr80_state::common_ram(offs_t offset) const
+bool zephyr80_state::safe_ram(offs_t offset) const
 {
-	return offset <= zephyr80_map::mem::COMMON_RAM_END;
-}
-
-bool zephyr80_state::ram_only(offs_t offset) const
-{
-	return (offset >= zephyr80_map::mem::RAM_ONLY_START) && (offset <= zephyr80_map::mem::RAM_ONLY_END);
-}
-
-bool zephyr80_state::upper_32k(offs_t offset) const
-{
-	return offset >= zephyr80_map::mem::UPPER_32K_START;
+	// SAFE_RAM = A15 & A14 -> $C000-$FFFF (high 16K common area).
+	return offset >= zephyr80_map::mem::SAFE_RAM_START;
 }
 
 bool zephyr80_state::ram_shadow() const
@@ -363,21 +321,30 @@ bool zephyr80_state::rom_disabled() const
 	return bool(m_latch & zephyr80_map::latch::ROM_DIS);
 }
 
-bool zephyr80_state::all_ram_mode() const
+u8 zephyr80_state::rom_page() const
 {
-	return rom_disabled() && !m_cart_detect;
+	return (m_latch & zephyr80_map::latch::ROM_PAGE_MASK) >> zephyr80_map::latch::ROM_PAGE_SHIFT;
 }
 
 u8 zephyr80_state::selected_ram_bank(offs_t offset) const
 {
 	// MEM_DECODER.pld:
-	// ALL_RAM_MODE = ROM_DIS && !CART_DETECT
-	// FORCE_BANK0 = COMMON_RAM && ALL_RAM_MODE
-	// RAM_A16..A18 = BANK_Q0..2 && !FORCE_BANK0
-	if (common_ram(offset) && all_ram_mode())
+	//   FORCE_BANK0 = SAFE_RAM & (ROM_DIS # RAM_SHADOW)
+	//   RAM_A16..A18 = BANK_Q0..2 & !FORCE_BANK0
+	// The high 16K common area resolves to SRAM bank 0 whenever ROM is disabled
+	// or shadow/copy mode is active, so it stays shared across all banks.
+	if (safe_ram(offset) && (rom_disabled() || ram_shadow()))
 		return 0;
 
-	return m_latch & (zephyr80_map::latch::BANK_Q0 | zephyr80_map::latch::BANK_Q1 | zephyr80_map::latch::BANK_Q2);
+	return m_latch & zephyr80_map::latch::BANK_MASK;
+}
+
+u8 zephyr80_state::rom_r(offs_t offset) const
+{
+	// ROM page (latch D5-D7) drives ROM A16-A18; the CPU supplies A0-A15.
+	u32 const rom_addr = (u32(rom_page()) << 16) | (offset & 0xffff);
+	u8 const *rom = m_rom_region->base();
+	return (rom_addr < m_rom_region->bytes()) ? rom[rom_addr] : 0xff;
 }
 
 u8 zephyr80_state::ram_r(offs_t offset) const
@@ -390,15 +357,28 @@ void zephyr80_state::ram_w(offs_t offset, u8 data)
 	m_ram[(selected_ram_bank(offset) * zephyr80_map::mem::RAM_BANK_SIZE) + (offset & 0xffff)] = data;
 }
 
+// IM2 interrupt daisy chain.  Priority order (highest first) is a hardware
+// property still to be confirmed against the CPU/IO board; CTC ahead of the
+// SIOs is the conventional Z80 arrangement and is functionally moot today since
+// the firmware disables the CTC and polls SIO1 (only SIO0/B raises interrupts).
+static const z80_daisy_config zephyr80_daisy[] =
+{
+	{ "ctc" },
+	{ "sio0" },
+	{ "sio1" },
+	{ nullptr }
+};
+
 void zephyr80_state::zephyr80(machine_config &config)
 {
 	Z80(config, m_maincpu, 10_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &zephyr80_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &zephyr80_state::io_map);
+	m_maincpu->set_daisy_config(zephyr80_daisy);
 
-	Z80SIO(config, m_sio0, 4_MHz_XTAL);
+	Z80SIO(config, m_sio0, 10_MHz_XTAL);
 	m_sio0->set_cputag(m_maincpu);
-	m_sio0->out_int_callback().set(FUNC(zephyr80_state::sio0_irq_w));
+	m_sio0->out_int_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
 	m_sio0->out_txda_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_txd));
 	m_sio0->out_dtra_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_dtr));
 	m_sio0->out_rtsa_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_rts));
@@ -415,24 +395,34 @@ void zephyr80_state::zephyr80(machine_config &config)
 	sio0b_rs232.rxd_handler().set(m_sio0, FUNC(z80sio_device::rxb_w));
 	sio0b_rs232.cts_handler().set(m_sio0, FUNC(z80sio_device::ctsb_w));
 	sio0b_rs232.dcd_handler().set(m_sio0, FUNC(z80sio_device::dcdb_w));
+	sio0b_rs232.set_option_device_input_defaults("pty", DEVICE_INPUT_DEFAULTS_NAME(console_baud_115200));
+	sio0b_rs232.set_option_device_input_defaults("loopback", DEVICE_INPUT_DEFAULTS_NAME(console_baud_115200));
 
-	Z80SIO(config, m_sio1, 4_MHz_XTAL);
+	Z80SIO(config, m_sio1, 10_MHz_XTAL);
 	m_sio1->set_cputag(m_maincpu);
-	m_sio1->out_int_callback().set(FUNC(zephyr80_state::sio1_irq_w));
+	m_sio1->out_int_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+
+	// CTC: four channels at $40-$43.  On real hardware the console baud is fixed
+	// (not CTC-derived); only the user channel (SIO0/A) takes its clock from the
+	// CTC.  Route CTC channel 0 to SIO0/A rx/tx.  The CTC clock crystal and the
+	// exact channel->baud/tick assignment are hardware details still to be
+	// confirmed; the firmware only disables the CTC at boot.
+	Z80CTC(config, m_ctc, 10_MHz_XTAL);
+	m_ctc->intr_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+	m_ctc->zc_callback<0>().set(m_sio0, FUNC(z80sio_device::rxca_w));
+	m_ctc->zc_callback<0>().append(m_sio0, FUNC(z80sio_device::txca_w));
 
 	PBITZ_COFFEEIO(config, m_coffeeio);
 	m_coffeeio->response_a_callback().set(FUNC(zephyr80_state::coffeeio_a_response_w));
 
-	// Temporary Phase 9 clocks: enough to let the real MAME SIO shift TX data
-	// and return TX-empty/RX-ready status.  Final baud-rate generation and
-	// CTC/SIO clock topology still need to be derived from the hardware.
-	clock_device &sio0a_clock(CLOCK(config, "sio0a_clock", 9'600 * 16));
-	sio0a_clock.signal_handler().set(m_sio0, FUNC(z80sio_device::rxca_w));
-	sio0a_clock.signal_handler().append(m_sio0, FUNC(z80sio_device::txca_w));
-
-	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 9'600 * 16));
+	// Console (SIO0/B) baud is fixed in hardware at 115200 8N1.  The firmware
+	// programs WR4 for a x16 clock, so feed channel B a 115200 x 16 clock.
+	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 115'200 * 16));
 	sio0b_clock.signal_handler().set(m_sio0, FUNC(z80sio_device::rxtxcb_w));
 
+	// SIO1 is the synchronous IO-controller link, externally clocked by the MCU
+	// glue during a transaction.  These placeholder clocks let the MAME SIO shift
+	// and report TX-empty/RX-ready until the COFFEE-IO transport drives them.
 	clock_device &sio1a_clock(CLOCK(config, "sio1a_clock", 9'600 * 16));
 	sio1a_clock.signal_handler().set(m_sio1, FUNC(z80sio_device::rxca_w));
 	sio1a_clock.signal_handler().append(m_sio1, FUNC(z80sio_device::txca_w));
@@ -442,8 +432,10 @@ void zephyr80_state::zephyr80(machine_config &config)
 }
 
 ROM_START(zephyr80)
-	ROM_REGION(0x80000, "maincpu", ROMREGION_ERASEFF)
-	ROM_LOAD("zephyr80.bin", 0x0000, 0x2000, BAD_DUMP CRC(00000000) SHA1(0000000000000000000000000000000000000000))
+	// 512 KiB ROM address space (8 pages x 64 KiB, latch D5-D7 = page).  The
+	// current CP/M firmware populates pages 0-1 (128 KiB); higher pages read 0xff.
+	ROM_REGION(zephyr80_map::mem::ROM_SIZE, "maincpu", ROMREGION_ERASEFF)
+	ROM_LOAD("zephyr80.bin", 0x00000, 0x20000, CRC(458d5603) SHA1(3aed6264ab20cd30140e49c7e9c8faa705c00998))
 ROM_END
 
 } // anonymous namespace
