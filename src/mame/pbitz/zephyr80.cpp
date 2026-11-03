@@ -27,8 +27,8 @@ void pbitz_rs232_devices(device_slot_interface &device)
 	device.option_add("loopback", RS232_LOOPBACK);
 }
 
-// The SIO0/B console link runs at a fixed 115200 8N1 in hardware, so default any
-// device attached to that port to 115200 (matching the SIO channel B clock).
+// The SIO0/B console link runs at a fixed 115200 8N1 (1.8432 MHz x16), so default
+// any device attached to that port to 115200.
 static DEVICE_INPUT_DEFAULTS_START(console_baud_115200)
 	DEVICE_INPUT_DEFAULTS("RS232_TXBAUD", 0xff, RS232_BAUD_115200)
 	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_115200)
@@ -76,7 +76,15 @@ private:
 	void sio0_w(offs_t offset, u8 data);
 	u8 sio1_r(offs_t offset);
 	void sio1_w(offs_t offset, u8 data);
+	u8 ctc_r(offs_t offset);
+	void ctc_w(offs_t offset, u8 data);
 
+	void vdp_int_w(int state);
+	void daisy_int_w(int state);
+	void update_irq();
+	IRQ_CALLBACK_MEMBER(unclaimed_ack);
+
+	u8 m_vdp_int = 0;
 };
 
 void zephyr80_state::machine_start()
@@ -86,6 +94,7 @@ void zephyr80_state::machine_start()
 
 	save_pointer(NAME(m_ram), zephyr80_map::mem::RAM_SIZE);
 	save_item(NAME(m_latch));
+	save_item(NAME(m_vdp_int));
 }
 
 void zephyr80_state::machine_reset()
@@ -93,6 +102,8 @@ void zephyr80_state::machine_reset()
 	m_latch = 0; // Mode 00, flash page 0, SRAM bank 0.
 	m_sio1->rxa_w(1);
 	m_sio1->rxb_w(1);
+	m_vdp_int = 0; // V9958 reset clears its /INT output.
+	update_irq();
 }
 
 void zephyr80_state::mem_map(address_map &map)
@@ -116,9 +127,9 @@ void zephyr80_state::io_map(address_map &map)
 	map(io::SIO0_START, io::SIO0_START + io::SIO_REGISTER_MASK).mirror(io::SIO_REGISTER_MIRROR).rw(FUNC(zephyr80_state::sio0_r), FUNC(zephyr80_state::sio0_w));
 	map(io::SIO1_START, io::SIO1_START + io::SIO_REGISTER_MASK).mirror(io::SIO_REGISTER_MIRROR).rw(FUNC(zephyr80_state::sio1_r), FUNC(zephyr80_state::sio1_w));
 
-	// IO_DECODER.pld: CTC at $40-$4f.  Channels 0-3 select on A1:A0
-	// (CTC0_CTRL..CTC3_CTRL = $40..$43).
-	map(io::CTC_START, io::CTC_START + io::CTC_REGISTER_MASK).mirror(io::CTC_REGISTER_MIRROR).rw(m_ctc, FUNC(z80ctc_device::read), FUNC(z80ctc_device::write));
+	// IO_DECODER.pld: CTC at $40-$4f, A3:A2 mirrored.  CS0/CS1 are wired to
+	// A1/A0 (see zephyr80_map::io::ctc_channel): $40 ch0, $41 ch2, $42 ch1, $43 ch3.
+	map(io::CTC_START, io::CTC_START + io::CTC_REGISTER_MASK).mirror(io::CTC_REGISTER_MIRROR).rw(FUNC(zephyr80_state::ctc_r), FUNC(zephyr80_state::ctc_w));
 
 	// IO_DECODER.pld: V9958 VDP at $a0-$bf.  A1:A0 select the four V9958 ports:
 	// +0 VRAM data, +1 command/status, +2 palette, +3 register (read: +0 VRAM,
@@ -172,10 +183,56 @@ void zephyr80_state::sio1_w(offs_t offset, u8 data)
 	m_sio1->ba_cd_w(offset & zephyr80_map::io::SIO_REGISTER_MASK, data);
 }
 
-// IM2 interrupt daisy chain.  Priority order (highest first) is a hardware
-// property still to be confirmed against the CPU/IO board; CTC ahead of the
-// SIOs is the conventional Z80 arrangement and is functionally moot today since
-// the firmware disables the CTC and polls SIO1 (only SIO0/B raises interrupts).
+u8 zephyr80_state::ctc_r(offs_t offset)
+{
+	return m_ctc->read(zephyr80_map::io::ctc_channel(offset & zephyr80_map::io::CTC_REGISTER_MASK));
+}
+
+void zephyr80_state::ctc_w(offs_t offset, u8 data)
+{
+	m_ctc->write(zephyr80_map::io::ctc_channel(offset & zephyr80_map::io::CTC_REGISTER_MASK), data);
+}
+
+// /INT (IO board net `~{INT}`, bus CTRL_14, CPU pin 16) is a wired-OR of
+// open-drain requests with a backplane pull-up (RN7).  The daisy devices
+// (CTC, SIO0, SIO1) request only while their IEI is high, which the Z80 core
+// evaluates from the chain on every IRQ0 update.  So IRQ0 carries the level of
+// the sources outside the chain (the V9958) and every daisy change re-presents
+// it: the core then asserts the CPU line while any source requests, and no
+// source releasing its request clears another's.
+void zephyr80_state::update_irq()
+{
+	m_maincpu->set_input_line(INPUT_LINE_IRQ0, m_vdp_int ? ASSERT_LINE : CLEAR_LINE);
+}
+
+void zephyr80_state::vdp_int_w(int state)
+{
+	// The V9958 reports its level every scanline; forward only changes.
+	if (u8(state != CLEAR_LINE) != m_vdp_int)
+	{
+		m_vdp_int = state != CLEAR_LINE;
+		update_irq();
+	}
+}
+
+void zephyr80_state::daisy_int_w(int)
+{
+	update_irq();
+}
+
+// An acknowledge that no daisy device claims (the V9958's request) reads the
+// idle data bus: the backplane pulls D0-D7 high (RN5/RN6/RN7, 4.7 kOhm), so the
+// IM2 vector is $ff.
+IRQ_CALLBACK_MEMBER(zephyr80_state::unclaimed_ack)
+{
+	return 0xff;
+}
+
+// IM2 daisy chain, highest priority first, from the IO board nets: bus CTRL_18
+// (backplane RN5 pull-up) -> `/IO Controller Card/IEI` -> CTC IEI;
+// `Net-(IC1-IEO)` CTC IEO -> SIO0 IEI; `Net-(IC2-IEO)` SIO0 IEO -> SIO1 IEI;
+// SIO1 IEO -> `/IO Controller Card/IEO` (bus CTRL_17, unused).  The V9958 is
+// outside the chain.
 static const z80_daisy_config zephyr80_daisy[] =
 {
 	{ "ctc" },
@@ -193,10 +250,11 @@ void zephyr80_state::zephyr80(machine_config &config)
 	m_maincpu->set_addrmap(AS_PROGRAM, &zephyr80_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &zephyr80_state::io_map);
 	m_maincpu->set_daisy_config(zephyr80_daisy);
+	m_maincpu->set_irq_acknowledge_callback(FUNC(zephyr80_state::unclaimed_ack));
 
 	Z80SIO(config, m_sio0, 10_MHz_XTAL);
 	m_sio0->set_cputag(m_maincpu);
-	m_sio0->out_int_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+	m_sio0->out_int_callback().set(FUNC(zephyr80_state::daisy_int_w));
 	m_sio0->out_txda_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_txd));
 	m_sio0->out_dtra_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_dtr));
 	m_sio0->out_rtsa_callback().set("sio0a_rs232", FUNC(rs232_port_device::write_rts));
@@ -218,38 +276,42 @@ void zephyr80_state::zephyr80(machine_config &config)
 
 	Z80SIO(config, m_sio1, 10_MHz_XTAL);
 	m_sio1->set_cputag(m_maincpu);
-	m_sio1->out_int_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+	m_sio1->out_int_callback().set(FUNC(zephyr80_state::daisy_int_w));
 
-	// CTC: four channels at $40-$43.  On real hardware the console baud is fixed
-	// (not CTC-derived); only the user channel (SIO0/A) takes its clock from the
-	// CTC.  Route CTC channel 0 to SIO0/A rx/tx.  The CTC clock crystal and the
-	// exact channel->baud/tick assignment are hardware details still to be
-	// confirmed; the firmware only disables the CTC at boot.
+	// CTC: CLK is the 10 MHz bus clock (`CLK_10M`), so timer mode counts
+	// 10 MHz through the 16/256 prescaler.  CLK/TRG0-3 come from the 74HC4040
+	// (U8) dividing the 14.7456 MHz oscillator Y1: `/Baud Clock/CLK_1M8432`
+	// (Q2) -> TRG0, `CLK_3M6864` (Q1) -> TRG1, `CLK_7M3728` (Q0) -> TRG2 and
+	// TRG3.  The channel clocks give counter mode its rate and start an
+	// externally triggered timer one trigger period after its constant; edge
+	// polarity and the phase between the divider outputs are not modelled.
+	// ZC/TO0 (`USR_UART_BAUD_CLK`) clocks SIO0/A RxCA and TxCA.
 	Z80CTC(config, m_ctc, 10_MHz_XTAL);
-	m_ctc->intr_callback().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+	m_ctc->set_clk<0>(14.7456_MHz_XTAL / 8);
+	m_ctc->set_clk<1>(14.7456_MHz_XTAL / 4);
+	m_ctc->set_clk<2>(14.7456_MHz_XTAL / 2);
+	m_ctc->set_clk<3>(14.7456_MHz_XTAL / 2);
+	m_ctc->intr_callback().set(FUNC(zephyr80_state::daisy_int_w));
 	m_ctc->zc_callback<0>().set(m_sio0, FUNC(z80sio_device::rxca_w));
 	m_ctc->zc_callback<0>().append(m_sio0, FUNC(z80sio_device::txca_w));
 
-	// V9958 video card at $a0-$bf, driven directly by CP/M/BIOS I/O.  The card's
-	// /INT is wired to the CPU maskable interrupt: it is not part of the Z80 IM2
-	// daisy chain, so on interrupt-acknowledge the (pulled-high) data bus returns
-	// $ff -- the Z80 core reproduces this by falling back to the default vector
-	// when no daisy device is the source, giving IM2 vector $ff (I:$ff).
+	// V9958 video card at $a0-$bf.  Its /INT shares the CPU maskable interrupt
+	// outside the daisy chain; its acknowledge reads $ff (unclaimed_ack).
 	V9958(config, m_vdp, 21.477272_MHz_XTAL);
 	m_vdp->set_screen_ntsc("screen");
 	m_vdp->set_vram_size(0x20000); // 128 KiB
-	m_vdp->int_cb().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
+	m_vdp->int_cb().set(FUNC(zephyr80_state::vdp_int_w));
 
 	SCREEN(config, "screen", SCREEN_TYPE_RASTER);
 
-	// Console (SIO0/B) baud is fixed in hardware at 115200 8N1.  The firmware
-	// programs WR4 for a x16 clock, so feed channel B a 115200 x 16 clock.
-	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 115'200 * 16));
+	// Console SIO0/B RxTxCB is `/Baud Clock/CLK_1M8432` (U8 Q2), the same net as
+	// CTC TRG0; guests program x16, giving 115200 baud.
+	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 14.7456_MHz_XTAL / 8));
 	sio0b_clock.signal_handler().set(m_sio0, FUNC(z80sio_device::rxtxcb_w));
 
-	// SIO1 is the synchronous IO-controller link, externally clocked by the MCU
-	// glue during a transaction.  These placeholder clocks let the MAME SIO shift
-	// while the link is unconnected.
+	// SIO1 is the IO-controller link.  These free-running clocks are
+	// placeholders that keep the unconnected channels shifting; they do not
+	// model the link's clocking.
 	clock_device &sio1a_clock(CLOCK(config, "sio1a_clock", 9'600 * 16));
 	sio1a_clock.signal_handler().set(m_sio1, FUNC(z80sio_device::rxca_w));
 	sio1a_clock.signal_handler().append(m_sio1, FUNC(z80sio_device::txca_w));

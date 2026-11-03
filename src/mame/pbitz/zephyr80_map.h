@@ -47,9 +47,17 @@ static constexpr u8 SIO_CHAN_A_CONTROL = 0x01;
 static constexpr u8 SIO_CHAN_B_DATA = 0x02;
 static constexpr u8 SIO_CHAN_B_CONTROL = 0x03;
 
-// Z80CTC channels select on A1:A0 within the $40-$4f block.
+// Z80CTC in the $40-$4f block (A3:A2 mirrored).  IO board nets
+// `/IO Controller Card/A1` -> CTC CS0 (pin 18) and `/IO Controller Card/A0`
+// -> CTC CS1 (pin 19), so the channel is A0*2 + A1: $40 ch0, $41 ch2, $42 ch1,
+// $43 ch3.
 static constexpr u8 CTC_REGISTER_MASK = 0x03;
 static constexpr u8 CTC_REGISTER_MIRROR = 0x0c;
+
+constexpr u8 ctc_channel(u8 offset)
+{
+	return ((offset & 0x01) << 1) | ((offset >> 1) & 0x01);
+}
 
 // V9958 ports select on A1:A0 within the $a0-$bf block (A2-A4 mirrored).
 static constexpr u8 VDP_REGISTER_MASK = 0x03;
@@ -108,6 +116,7 @@ constexpr mapping decode(u16 address, u8 value)
 }
 
 static_assert(mem::RAM_SIZE == 512 * 1024 && mem::ROM_SIZE == 512 * 1024);
+static_assert(io::ctc_channel(0) == 0 && io::ctc_channel(1) == 2 && io::ctc_channel(2) == 1 && io::ctc_channel(3) == 3);
 
 } // namespace zephyr80_map
 
