@@ -220,6 +220,11 @@ device_z80daisy_interface *z80_daisy_chain_interface::daisy_get_irq_device()
 		int state = intf->z80daisy_irq_state();
 		if (state & Z80_DAISY_INT)
 			return intf;
+
+		// a device in service (IEO low) blocks everyone below it, as in
+		// daisy_update_irq_state(); nobody lower can answer the acknowledge
+		if (state & Z80_DAISY_IEO)
+			break;
 	}
 
 	if (VERBOSE && daisy_chain_present())

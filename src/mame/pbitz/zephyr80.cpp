@@ -78,13 +78,16 @@ private:
 	void sio1_w(offs_t offset, u8 data);
 	u8 ctc_r(offs_t offset);
 	void ctc_w(offs_t offset, u8 data);
+	u8 vdp_r(offs_t offset);
+	void vdp_w(offs_t offset, u8 data);
 
 	void vdp_int_w(int state);
 	void daisy_int_w(int state);
 	void update_irq();
 	IRQ_CALLBACK_MEMBER(unclaimed_ack);
 
-	u8 m_vdp_int = 0;
+	u8 m_vdp_int = 0;    // V9958 /INT level
+	u8 m_vdp_config = 0; // LunchCrema 74HC273: bit 0 route, bit 1 ~WS_EN
 };
 
 void zephyr80_state::machine_start()
@@ -95,6 +98,7 @@ void zephyr80_state::machine_start()
 	save_pointer(NAME(m_ram), zephyr80_map::mem::RAM_SIZE);
 	save_item(NAME(m_latch));
 	save_item(NAME(m_vdp_int));
+	save_item(NAME(m_vdp_config));
 }
 
 void zephyr80_state::machine_reset()
@@ -103,6 +107,7 @@ void zephyr80_state::machine_reset()
 	m_sio1->rxa_w(1);
 	m_sio1->rxb_w(1);
 	m_vdp_int = 0; // V9958 reset clears its /INT output.
+	m_vdp_config = 0; // ~RESET clears the 74HC273.
 	update_irq();
 }
 
@@ -131,10 +136,11 @@ void zephyr80_state::io_map(address_map &map)
 	// A1/A0 (see zephyr80_map::io::ctc_channel): $40 ch0, $41 ch2, $42 ch1, $43 ch3.
 	map(io::CTC_START, io::CTC_START + io::CTC_REGISTER_MASK).mirror(io::CTC_REGISTER_MIRROR).rw(FUNC(zephyr80_state::ctc_r), FUNC(zephyr80_state::ctc_w));
 
-	// IO_DECODER.pld: V9958 VDP at $a0-$bf.  A1:A0 select the four V9958 ports:
-	// +0 VRAM data, +1 command/status, +2 palette, +3 register (read: +0 VRAM,
-	// +1 status).
-	map(io::VDP_START, io::VDP_START + io::VDP_REGISTER_MASK).mirror(io::VDP_REGISTER_MIRROR).rw(m_vdp, FUNC(v9958_device::read), FUNC(v9958_device::write));
+	// IO_DECODER.pld: LunchCrema V9958 card at $a0-$bf.  A1:A0 select the four
+	// V9958 ports: +0 VRAM data, +1 command/status, +2 palette, +3 register
+	// (read: +0 VRAM, +1 status).  A write with A2 set is the interrupt
+	// configuration latch instead (see vdp_w).
+	map(io::VDP_START, io::VDP_END).rw(FUNC(zephyr80_state::vdp_r), FUNC(zephyr80_state::vdp_w));
 
 	// Reserved by IO_DECODER.pld for future phases:
 	// $60-$6f cartridge I/O,
@@ -193,6 +199,28 @@ void zephyr80_state::ctc_w(offs_t offset, u8 data)
 	m_ctc->write(zephyr80_map::io::ctc_channel(offset & zephyr80_map::io::CTC_REGISTER_MASK), data);
 }
 
+u8 zephyr80_state::vdp_r(offs_t offset)
+{
+	// 74AHCT139 half 1 (A0 = ~RD, A1 = GND): every read in the window is ~CSR.
+	return m_vdp->read(offset & zephyr80_map::io::VDP_REGISTER_MASK);
+}
+
+void zephyr80_state::vdp_w(offs_t offset, u8 data)
+{
+	if (zephyr80_map::io::vdp_config_select(offset))
+	{
+		// ~INT_MODE clocks the 74HC273.  D1 (~WS_EN) only enables the card's
+		// WAIT generator, which this machine does not model: it is stored and
+		// has no timing effect.  A latch write re-routes an asserted request.
+		m_vdp_config = data & zephyr80_map::io::VDP_CONFIG_MASK;
+		update_irq();
+	}
+	else
+	{
+		m_vdp->write(offset & zephyr80_map::io::VDP_REGISTER_MASK, data);
+	}
+}
+
 // /INT (IO board net `~{INT}`, bus CTRL_14, CPU pin 16) is a wired-OR of
 // open-drain requests with a backplane pull-up (RN7).  The daisy devices
 // (CTC, SIO0, SIO1) request only while their IEI is high, which the Z80 core
@@ -200,9 +228,16 @@ void zephyr80_state::ctc_w(offs_t offset, u8 data)
 // the sources outside the chain (the V9958) and every daisy change re-presents
 // it: the core then asserts the CPU line while any source requests, and no
 // source releasing its request clears another's.
+//
+// The LunchCrema card steers the V9958 ~INT with the 74HC273 bit Q0 through
+// the 74LVC1G19 (U8): Q0 = 0 drives /Video/~INT (CTRL_14, the wired-OR above),
+// Q0 = 1 drives /Video/~NMI (CTRL_15), which the CPU board wires to the Z80
+// ~NMI (J2.A12 -> U3.17).  An NMI is not acknowledged and no vector is read.
 void zephyr80_state::update_irq()
 {
-	m_maincpu->set_input_line(INPUT_LINE_IRQ0, m_vdp_int ? ASSERT_LINE : CLEAR_LINE);
+	bool const nmi = m_vdp_config & zephyr80_map::io::VDP_CONFIG_NMI;
+	m_maincpu->set_input_line(INPUT_LINE_NMI, m_vdp_int && nmi ? ASSERT_LINE : CLEAR_LINE);
+	m_maincpu->set_input_line(INPUT_LINE_IRQ0, m_vdp_int && !nmi ? ASSERT_LINE : CLEAR_LINE);
 }
 
 void zephyr80_state::vdp_int_w(int state)
@@ -295,8 +330,9 @@ void zephyr80_state::zephyr80(machine_config &config)
 	m_ctc->zc_callback<0>().set(m_sio0, FUNC(z80sio_device::rxca_w));
 	m_ctc->zc_callback<0>().append(m_sio0, FUNC(z80sio_device::txca_w));
 
-	// V9958 video card at $a0-$bf.  Its /INT shares the CPU maskable interrupt
-	// outside the daisy chain; its acknowledge reads $ff (unclaimed_ack).
+	// V9958 video card at $a0-$bf.  Its /INT joins the CPU maskable interrupt
+	// outside the daisy chain (acknowledge reads $ff, unclaimed_ack) or drives
+	// the CPU NMI, as the card's configuration latch selects (update_irq).
 	V9958(config, m_vdp, 21.477272_MHz_XTAL);
 	m_vdp->set_screen_ntsc("screen");
 	m_vdp->set_vram_size(0x20000); // 128 KiB

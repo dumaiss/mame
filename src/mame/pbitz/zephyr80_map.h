@@ -59,9 +59,22 @@ constexpr u8 ctc_channel(u8 offset)
 	return ((offset & 0x01) << 1) | ((offset >> 1) & 0x01);
 }
 
-// V9958 ports select on A1:A0 within the $a0-$bf block (A2-A4 mirrored).
+// V9958 ports select on A1:A0 within the $a0-$bf block (A3/A4 mirrored).  The
+// LunchCrema card decodes ~{CS_VDP} with a 74AHCT139: reads always select the
+// VDP (A2 ignored); a write with A2=0 is ~{CSW} to the VDP and a write with
+// A2=1 is ~{INT_MODE}, which clocks the 74HC273 configuration latch.
 static constexpr u8 VDP_REGISTER_MASK = 0x03;
-static constexpr u8 VDP_REGISTER_MIRROR = 0x1c;
+static constexpr u8 VDP_CONFIG_SELECT = 0x04;
+// 74HC273 inputs: D0 -> Q0 routes the V9958 ~{INT} (0: /INT = CTRL_14,
+// 1: /NMI = CTRL_15); D1 -> Q1 = ~{WS_EN} for the WAIT generator.  D2-D7 are
+// tied low.
+static constexpr u8 VDP_CONFIG_MASK = 0x03;
+static constexpr u8 VDP_CONFIG_NMI = 0x01;
+
+constexpr bool vdp_config_select(u8 offset)
+{
+	return (offset & VDP_CONFIG_SELECT) != 0;
+}
 } // namespace io
 
 // MEM_DECODER.pld Rev 13: Q=D2:D0, mode=D4:D3, P=D7:D5.
@@ -117,6 +130,7 @@ constexpr mapping decode(u16 address, u8 value)
 
 static_assert(mem::RAM_SIZE == 512 * 1024 && mem::ROM_SIZE == 512 * 1024);
 static_assert(io::ctc_channel(0) == 0 && io::ctc_channel(1) == 2 && io::ctc_channel(2) == 1 && io::ctc_channel(3) == 3);
+static_assert(!io::vdp_config_select(0x03) && io::vdp_config_select(0x04) && io::vdp_config_select(0x07) && !io::vdp_config_select(0x18) && io::vdp_config_select(0x1c));
 
 } // namespace zephyr80_map
 
