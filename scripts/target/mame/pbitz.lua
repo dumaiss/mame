@@ -55,8 +55,6 @@ function createProjects_mame_pbitz(_target, _subtarget)
 		MAME_DIR .. "src/devices/video/v9938.cpp",
 		MAME_DIR .. "src/devices/video/v9938.h",
 		MAME_DIR .. "src/mame/pbitz/coffeez80.cpp",
-		MAME_DIR .. "src/mame/pbitz/pbitz_coffeeio.cpp",
-		MAME_DIR .. "src/mame/pbitz/pbitz_coffeeio.h",
 		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.cpp",
 		MAME_DIR .. "src/mame/pbitz/pbitz_memctl.h",
 		MAME_DIR .. "src/mame/pbitz/pbitz_serial.cpp",
@@ -65,6 +63,8 @@ function createProjects_mame_pbitz(_target, _subtarget)
 		MAME_DIR .. "src/mame/pbitz/pbitz_zsio.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_map.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr_banktst.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr_siotop.cpp",
 	}
