@@ -37,6 +37,14 @@ static constexpr u8 RESERVED_C0_END = 0xdf;
 static constexpr u8 SOUND_CTRL_START = 0xe0;
 static constexpr u8 SOUND_CTRL_END = 0xff;
 
+// Afternoon Blend: U8 (74AHCT138) decodes A2:A0 only, so ports repeat every 8
+// across $e0-$ff.  Ports 0-3 are PSG0-PSG3, port 4 the DAC, ports 5-7 unwired.
+static constexpr u8 SOUND_PORT_MASK = 0x07;
+static constexpr u8 SOUND_PSG_COUNT = 4;
+static constexpr u8 SOUND_DAC_PORT = 4;
+// Scheduler trigger the stretched PSG write waits on.
+static constexpr int SOUND_READY_TRIGGER = 0x5e11;
+
 // Z80SIO register order matches the firmware (platform_zephyr80.inc), which is
 // MAME's ba_cd accessors: A1 = channel (B/A), A0 = control/data, giving
 // A data, A control, B data, B control in each 4-byte window.

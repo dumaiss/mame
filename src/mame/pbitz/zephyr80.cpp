@@ -19,9 +19,12 @@
 #include "machine/z80ctc.h"
 #include "machine/z80daisy.h"
 #include "machine/z80sio.h"
+#include "sound/dac.h"
+#include "sound/sn76496.h"
 #include "video/v9938.h"
 
 #include "screen.h"
+#include "speaker.h"
 
 
 namespace {
@@ -46,6 +49,15 @@ static DEVICE_INPUT_DEFAULTS_START(console_baud_115200)
 	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_115200)
 DEVICE_INPUT_DEFAULTS_END
 
+// A card input's weight in the mono mix: the inverting stage's 10 kOhm
+// feedback over each side's input resistor (kOhm), the two sides averaged,
+// times the scale.
+constexpr double mix_gain(double left_kohm, double right_kohm)
+{
+	constexpr double MIX_SCALE = 0.66;
+	return MIX_SCALE * 0.5 * (10.0 / left_kohm + 10.0 / right_kohm);
+}
+
 class zephyr80_state : public driver_device
 {
 public:
@@ -57,6 +69,8 @@ public:
 		, m_ioc(*this, "ioc")
 		, m_ctc(*this, "ctc")
 		, m_vdp(*this, "vdp")
+		, m_psg(*this, "psg%u", 0U)
+		, m_dac(*this, "dac")
 		, m_flash(*this, "flash")
 	{
 	}
@@ -74,6 +88,8 @@ private:
 	required_device<zephyr80_ioc_device> m_ioc;
 	required_device<z80ctc_device> m_ctc;
 	required_device<v9958_device> m_vdp;
+	required_device_array<sn76489a_device, 4> m_psg;
+	required_device<dac_8bit_r2r_device> m_dac;
 	required_device<zephyr80_flash_device> m_flash;
 
 	// The IO controller's SD socket; -card and -carddir insert its media.
@@ -97,6 +113,9 @@ private:
 	void ctc_w(offs_t offset, u8 data);
 	u8 vdp_r(offs_t offset);
 	void vdp_w(offs_t offset, u8 data);
+	u8 ctrl_r();
+	void sound_w(offs_t offset, u8 data);
+	void psg_ready_w(int state);
 
 	void vdp_int_w(int state);
 	void daisy_int_w(int state);
@@ -124,6 +143,9 @@ void zephyr80_state::machine_reset()
 	m_vdp_int = 0; // V9958 reset clears its /INT output.
 	m_vdp_config = 0; // ~RESET clears the 74HC273.
 	update_irq();
+	// ~RESET reaches the AD7801 ~CLR, which zeroes its DAC register.  The PSGs
+	// have no reset input and keep their registers.
+	m_dac->data_w(0x00);
 }
 
 void zephyr80_state::mem_map(address_map &map)
@@ -157,9 +179,14 @@ void zephyr80_state::io_map(address_map &map)
 	// configuration latch instead (see vdp_w).
 	map(io::VDP_START, io::VDP_END).rw(FUNC(zephyr80_state::vdp_r), FUNC(zephyr80_state::vdp_w));
 
+	// IO_DECODER.pld: $e0-$ff is SOUND on write and CTRL on read.  The Afternoon
+	// Blend card decodes only A2:A0 (74AHCT138 U8), so its eight ports repeat
+	// four times across the block (see sound_w).  Reads are the controller
+	// latches: all ones until they exist, and no sound device sees a read.
+	map(io::SOUND_CTRL_START, io::SOUND_CTRL_END).rw(FUNC(zephyr80_state::ctrl_r), FUNC(zephyr80_state::sound_w));
+
 	// Reserved by IO_DECODER.pld for future phases:
-	// $60-$6f cartridge I/O,
-	// $e0-$ff SOUND on write and CTRL on read.
+	// $60-$6f cartridge I/O.
 }
 
 u8 zephyr80_state::mem_r(offs_t offset)
@@ -234,6 +261,47 @@ void zephyr80_state::vdp_w(offs_t offset, u8 data)
 	{
 		m_vdp->write(offset & zephyr80_map::io::VDP_REGISTER_MASK, data);
 	}
+}
+
+u8 zephyr80_state::ctrl_r()
+{
+	return 0xff;
+}
+
+// Afternoon Blend (Sound.kicad_sch).  U8 (74AHCT138) decodes A2:A0 with /WR on
+// its enable: Y0-Y3 select PSG0-PSG3 (SN76489AN, pin 6 /CE), Y4 the AD7801
+// (/CS) and Y5-Y7 are unconnected, so writes to ports 5-7 do nothing.  The bus
+// D7 (MSB) reaches the PSG pin the datasheet calls D0 (its MSB) through U4, so
+// the PSGs take conventional bytes (bit 7 = latch) and the AD7801 an offset
+// binary code, DB7 = MSB.
+//
+// A PSG write also sets U5A, which holds the bus /WAIT low through Q1 until
+// READY_ALL (the open-collector READY pins of the four PSGs) rises: the chip
+// holds READY low for 32 clocks of its input after a write.  The Z80 core has
+// no WAIT input model, so the cycle is stretched by suspending the CPU until
+// the stock device's READY rises (psg_ready_w).
+void zephyr80_state::sound_w(offs_t offset, u8 data)
+{
+	unsigned const port = offset & zephyr80_map::io::SOUND_PORT_MASK;
+	if (port < zephyr80_map::io::SOUND_PSG_COUNT)
+	{
+		m_psg[port]->write(data);
+		if (!m_psg[port]->ready_r())
+			m_maincpu->suspend_until_trigger(zephyr80_map::io::SOUND_READY_TRIGGER, true);
+	}
+	else if (port == zephyr80_map::io::SOUND_DAC_PORT)
+	{
+		m_dac->data_w(data);
+	}
+}
+
+void zephyr80_state::psg_ready_w(int)
+{
+	// READY_ALL is the wired-AND of the four READY outputs.
+	for (auto const &psg : m_psg)
+		if (!psg->ready_r())
+			return;
+	machine().scheduler().trigger(zephyr80_map::io::SOUND_READY_TRIGGER);
 }
 
 // /INT (IO board net `~{INT}`, bus CTRL_14, CPU pin 16) is a wired-OR of
@@ -363,6 +431,28 @@ void zephyr80_state::zephyr80(machine_config &config)
 
 	SCREEN(config, "screen", SCREEN_TYPE_RASTER);
 
+	// Afternoon Blend sound card at $e0-$ff (writes): four SN76489AN PSGs on
+	// the card's 3.579545 MHz oscillator (Y1) and an AD7801 DAC, mixed to one
+	// speaker.  The card's analogue stage sums them with inverting op-amp
+	// stages and mixes left and right for this mono output; the gains below
+	// are its resistor ratios (feedback 10 kOhm over the input resistor,
+	// left and right averaged) times one scale that keeps four PSGs at full
+	// level plus the DAC at its positive extreme just under full scale.
+	// Device output levels (the PSG's output swing against the DAC's 0-5 V)
+	// are not in the schematic: PSG full scale and DAC full scale are taken
+	// as equal.
+	SPEAKER(config, "mono").front_center();
+	for (unsigned i = 0; i < m_psg.size(); i++)
+		SN76489A(config, m_psg[i], 3.579545_MHz_XTAL).ready_cb().set(FUNC(zephyr80_state::psg_ready_w));
+	// PSG0, PSG1: 33 kOhm to both sides.  PSG2: 22 kOhm left, 47 kOhm right.
+	// PSG3: 47 kOhm left, 22 kOhm right.  DAC: 47 kOhm to both sides.
+	m_psg[0]->add_route(ALL_OUTPUTS, "mono", mix_gain(33, 33));
+	m_psg[1]->add_route(ALL_OUTPUTS, "mono", mix_gain(33, 33));
+	m_psg[2]->add_route(ALL_OUTPUTS, "mono", mix_gain(22, 47));
+	m_psg[3]->add_route(ALL_OUTPUTS, "mono", mix_gain(47, 22));
+	// The DAC is stock 8-bit offset binary: 80h is zero, 00h is -1.0.
+	DAC_8BIT_R2R(config, m_dac).add_route(ALL_OUTPUTS, "mono", mix_gain(47, 47));
+
 	// Console SIO0/B RxTxCB is `/Baud Clock/CLK_1M8432` (U8 Q2), the same net as
 	// CTC TRG0; guests program x16, giving 115200 baud.
 	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 14.7456_MHz_XTAL / 8));
@@ -376,4 +466,4 @@ ROM_END
 
 
 COMP(2026, zephyr80, 0, 0, zephyr80, 0, zephyr80_state, empty_init,
-	"Kitamura", "Zephyr-80 prototype decode shell", MACHINE_NO_SOUND | MACHINE_NOT_WORKING)
+	"Kitamura", "Zephyr-80 prototype decode shell", MACHINE_NOT_WORKING)

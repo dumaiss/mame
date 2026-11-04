@@ -11,6 +11,8 @@
 
 CPUS["Z80"] = true
 MACHINES["Z80DAISY"] = true
+SOUNDS["DAC"] = true
+SOUNDS["SN76496"] = true
 
 function createProjects_mame_pbitz(_target, _subtarget)
 	project ("mame_pbitz")
