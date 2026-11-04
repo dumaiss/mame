@@ -37,8 +37,8 @@
 // effect happens inside bulk_received(), so XFER_STATUS (DONE) reports it
 // only after it completed.
 //
-// Media come from a zephyr80_ioc_storage backend; with none attached the
-// core answers as the firmware does with an empty card socket.
+// Media come from a zephyr80_ioc_storage backend, the card socket; an empty
+// socket answers as the firmware does with no card in it.
 class zephyr80_ioc_core
 {
 public:
@@ -80,8 +80,9 @@ public:
 
 	explicit zephyr80_ioc_core(link &transport);
 
-	// The backend serving the card socket, or nullptr for an empty socket.
-	void set_storage(storage *media);
+	// The backend serving the card socket; required before reset().
+	void set_storage(storage &media) { m_storage = &media; }
+	bool has_storage() const { return m_storage != nullptr; }
 
 	void reset();
 	// Calls save(item, name) for every persistent member.
@@ -120,8 +121,6 @@ private:
 	using card = storage::card;
 	using fr = storage::fr;
 
-	class empty_socket;
-
 	struct fs2_file
 	{
 		u32 generation;
@@ -143,7 +142,6 @@ private:
 	void hid_status(frame const &request, frame &reply) const;
 	void hid_input(frame const &request, frame &reply);
 	void hid_mouse(frame const &request, frame &reply);
-	void media_check();
 
 	// Bulk (bulk_channel.c)
 	u8 next_xfer_id();
@@ -163,7 +161,6 @@ private:
 	void vol_mount_cmd(frame const &request, frame &reply);
 	void vol_info(frame const &request, frame &reply);
 	void vol_init();
-	void vol_invalidate();
 	card vol_ensure_mounted();
 	card vol_mount(unsigned unit, u8 const *name11);
 	bool vol_map(unsigned unit, u32 block) const;
@@ -222,7 +219,6 @@ private:
 
 	link &m_link;
 	storage *m_storage;
-	u32 m_media_seen;
 
 	// Service counters (main.c svc_calls, svc_aborts)
 	u16 m_calls;
@@ -304,7 +300,6 @@ private:
 template <typename Save>
 void zephyr80_ioc_core::save_state(Save &&save)
 {
-	save(m_media_seen, "core.m_media_seen");
 	save(m_calls, "core.m_calls");
 	save(m_aborts, "core.m_aborts");
 	save(m_xfer_counter, "core.m_xfer_counter");

@@ -24,6 +24,8 @@ dxsdk - [DirectX SDK EULA](https://github.com/mamedev/mame/blob/master/3rdparty/
 
 expat - [The MIT License (MIT)](http://opensource.org/licenses/MIT)
 
+fatfs - FatFs R0.15 (ChaN), a 1-clause BSD-style license, see [fatfs/LICENSE.txt](fatfs/LICENSE.txt); the IO controller firmware's copy and configuration, used by the Zephyr-80 card socket
+
 flac - [The BSD 3-Clause License](http://opensource.org/licenses/BSD-3-Clause) (codecs), [The GNU General Public License, version 2](https://opensource.org/licenses/GPL-2.0)
 
 genie - [The BSD 3-Clause License](http://opensource.org/licenses/BSD-3-Clause)

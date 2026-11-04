@@ -487,59 +487,12 @@ bool share_path(char *out, u8 const *name11)
 } // anonymous namespace
 
 
-// The card socket with no card in it: what the firmware reports when no media
-// are attached (sd_card_init sees the presence pin and answers
-// SD_ERR_NO_CARD; nothing is dirty, so a flush succeeds).
-class zephyr80_ioc_core::empty_socket : public zephyr80_ioc_storage
-{
-public:
-	virtual card card_init() override { return card::NO_CARD; }
-	virtual bool card_ready() const override { return false; }
-	virtual u32 media_generation() const override { return 0; }
-	virtual void controller_reset() override { }
-	virtual bool raw_blocks() const override { return true; }
-	virtual card block_read(u32, u8 *) override { return card::NO_CARD; }
-	virtual card block_write(u32, u8 const *) override { return card::NO_CARD; }
-	virtual card flush() override { return card::OK; }
-	virtual card fs_mount(bool &mounted) override { mounted = false; return card::NO_CARD; }
-	virtual void fs_unmount() override { }
-	virtual fr fs_geometry(geometry &) override { return fr::NOT_READY; }
-	virtual fr stat(char const *, entry &) override { return fr::NOT_READY; }
-	virtual fr open(char const *, u8, object &) override { return fr::NOT_READY; }
-	virtual fr close(object) override { return fr::INVALID_OBJECT; }
-	virtual u32 size(object) const override { return 0; }
-	virtual fr seek(object, u32) override { return fr::INVALID_OBJECT; }
-	virtual fr read(object, u8 *, u16, u16 &done) override { done = 0; return fr::INVALID_OBJECT; }
-	virtual fr write(object, u8 const *, u16, u16 &done) override { done = 0; return fr::INVALID_OBJECT; }
-	virtual fr truncate(object) override { return fr::INVALID_OBJECT; }
-	virtual fr sync(object) override { return fr::INVALID_OBJECT; }
-	virtual fr opendir(char const *, object &) override { return fr::NOT_READY; }
-	virtual fr readdir(object, entry &) override { return fr::INVALID_OBJECT; }
-	virtual fr closedir(object) override { return fr::INVALID_OBJECT; }
-	virtual fr unlink(char const *) override { return fr::NOT_READY; }
-	virtual fr mkdir(char const *) override { return fr::NOT_READY; }
-	virtual fr rename(char const *, char const *) override { return fr::NOT_READY; }
-	virtual image_status image_open(u8 const *, u8 const *, u32, image &, object &) override { return image_status::IO; }
-	virtual void image_close(object) override { }
-	virtual card image_read(object, u32, u8 *) override { return card::NO_CARD; }
-	virtual card image_write(object, u32, u8 const *) override { return card::NO_CARD; }
-};
-
 zephyr80_ioc_core::zephyr80_ioc_core(link &transport)
 	: m_link(transport)
 	, m_storage(nullptr)
-	, m_media_seen(0)
 	, m_calls(0)
 	, m_aborts(0)
 {
-	set_storage(nullptr);
-}
-
-void zephyr80_ioc_core::set_storage(storage *media)
-{
-	static empty_socket socket;
-	m_storage = media ? media : &socket;
-	m_media_seen = m_storage->media_generation();
 }
 
 // The controller restarts with the board (main.c platform_init, hid_host_init):
@@ -547,7 +500,6 @@ void zephyr80_ioc_core::set_storage(storage *media)
 void zephyr80_ioc_core::reset()
 {
 	m_storage->controller_reset();
-	m_media_seen = m_storage->media_generation();
 	m_calls = 0;
 	m_aborts = 0;
 
@@ -671,21 +623,9 @@ unsigned zephyr80_ioc_core::encode(frame const &reply, u8 *wire)
 	return n;
 }
 
-// A media change is a lost card session (vol_ensure_mounted, sdfs_invalidate).
-void zephyr80_ioc_core::media_check()
-{
-	u32 const now = m_storage->media_generation();
-	if (now == m_media_seen)
-		return;
-	m_media_seen = now;
-	vol_invalidate();
-	sdfs_invalidate();
-}
-
 // dispatch.c dispatch_command, normal profile with the filesystem commands.
 bool zephyr80_ioc_core::dispatch(frame const &request, frame &reply)
 {
-	media_check();
 	switch (request[OFF_CLASS])
 	{
 	case CMD_FS2_CAPS:       fs2_caps(request, reply); break;
@@ -783,7 +723,6 @@ void zephyr80_ioc_core::xfer_status(frame const &request, frame &reply) const
 // the conventional images once the card is up by any path.
 void zephyr80_ioc_core::idle()
 {
-	media_check();
 	if (m_automount_done || !m_storage->card_ready())
 		return;
 	m_automount_done = true;
@@ -1085,11 +1024,6 @@ void zephyr80_ioc_core::vol_init()
 	}
 	m_mount_attempted = false;
 	m_automount_done = false;
-}
-
-void zephyr80_ioc_core::vol_invalidate()
-{
-	vol_init();
 }
 
 // vol_ensure_mounted: the card up, and unit 0 in raw mode as the fallback.

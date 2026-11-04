@@ -48,8 +48,8 @@ public:
 	zephyr80_ioc_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
 
 	void set_lane(zephyr80_ioc_lane_port &lane) { m_lane = &lane; }
-	// The media in the card socket; none means an empty socket.
-	void set_storage(zephyr80_ioc_storage *media) { m_core.set_storage(media); }
+	// The card socket's media (zephyr80_card_socket).
+	void set_storage(zephyr80_ioc_storage &media) { m_core.set_storage(media); }
 
 	// zephyr80_ioc_lane_client
 	virtual void lane_rts_changed(zephyr80_ioc_lane lane, bool asserted) override;

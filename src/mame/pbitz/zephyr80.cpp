@@ -4,6 +4,8 @@
 #include "emu.h"
 
 #include "zephyr80_map.h"
+#include "zephyr80_card.h"
+#include "zephyr80_card_slot.h"
 #include "zephyr80_flash.h"
 #include "zephyr80_ioc.h"
 #include "zephyr80_sio1.h"
@@ -65,6 +67,9 @@ private:
 	required_device<z80ctc_device> m_ctc;
 	required_device<v9958_device> m_vdp;
 	required_device<zephyr80_flash_device> m_flash;
+
+	// The IO controller's SD socket; -card and -carddir insert its media.
+	zephyr80_card_socket m_card;
 
 	std::unique_ptr<u8[]> m_ram;
 	u8 m_latch = 0;
@@ -318,6 +323,9 @@ void zephyr80_state::zephyr80(machine_config &config)
 	ZEPHYR80_IOC(config, m_ioc);
 	m_sio1->set_client(*m_ioc);
 	m_ioc->set_lane(*m_sio1);
+	m_ioc->set_storage(m_card);
+	ZEPHYR80_CARD_IMAGE(config, "card").set_socket(m_card);
+	ZEPHYR80_CARD_FOLDER(config, "carddir").set_socket(m_card);
 
 	// CTC: CLK is the 10 MHz bus clock (`CLK_10M`), so timer mode counts
 	// 10 MHz through the 16/256 prescaler.  CLK/TRG0-3 come from the 74HC4040

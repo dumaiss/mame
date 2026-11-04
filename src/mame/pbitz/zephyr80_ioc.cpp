@@ -51,6 +51,8 @@ void zephyr80_ioc_device::device_start()
 {
 	if (!m_lane)
 		throw emu_fatalerror("%s: no SIO1 lane attached", tag());
+	if (!m_core.has_storage())
+		throw emu_fatalerror("%s: no card socket attached", tag());
 	m_command_timer = timer_alloc(FUNC(zephyr80_ioc_device::command_step), this);
 
 	m_core.save_state([this] (auto &&... item) { save_item(std::forward<decltype(item)>(item)...); });

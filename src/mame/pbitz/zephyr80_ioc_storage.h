@@ -93,13 +93,13 @@ public:
 	// Bring the card up, or report why not: NO_CARD for an empty socket.
 	// Cheap once up.
 	virtual card card_init() = 0;
+	// The controller's belief that the card is up (card_ready).  It ends only
+	// when an access fails: a media change is never announced, so the core
+	// learns of one only through a failing operation, as the firmware does
+	// (vol_ensure_mounted, fs2.c map_result).
 	virtual bool card_ready() const = 0;
-	// Changes whenever the media is replaced or removed.  The core treats a
-	// change as the firmware treats a lost card session: the volume units and
-	// the filesystem mount are dropped and the FS2 generation advances.
-	virtual u32 media_generation() const = 0;
-	// The controller restarted (its RAM is gone): forget every open object
-	// and the filesystem mount.  Media contents persist.
+	// The controller restarted (its RAM is gone): forget every open object,
+	// the filesystem mount and the card session.  Media contents persist.
 	virtual void controller_reset() = 0;
 
 	// --- Raw card blocks (sd_card_read_block, sd_cache) --------------------
