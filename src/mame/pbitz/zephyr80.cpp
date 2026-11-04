@@ -5,6 +5,8 @@
 
 #include "zephyr80_map.h"
 #include "zephyr80_flash.h"
+#include "zephyr80_ioc.h"
+#include "zephyr80_sio1.h"
 
 #include "bus/rs232/loopback.h"
 #include "bus/rs232/pty.h"
@@ -42,6 +44,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_sio0(*this, "sio0")
 		, m_sio1(*this, "sio1")
+		, m_ioc(*this, "ioc")
 		, m_ctc(*this, "ctc")
 		, m_vdp(*this, "vdp")
 		, m_flash(*this, "flash")
@@ -57,7 +60,8 @@ protected:
 private:
 	required_device<z80_device> m_maincpu;
 	required_device<z80sio_device> m_sio0;
-	required_device<z80sio_device> m_sio1;
+	required_device<zephyr80_sio1_device> m_sio1;
+	required_device<zephyr80_ioc_device> m_ioc;
 	required_device<z80ctc_device> m_ctc;
 	required_device<v9958_device> m_vdp;
 	required_device<zephyr80_flash_device> m_flash;
@@ -104,8 +108,6 @@ void zephyr80_state::machine_start()
 void zephyr80_state::machine_reset()
 {
 	m_latch = 0; // Mode 00, flash page 0, SRAM bank 0.
-	m_sio1->rxa_w(1);
-	m_sio1->rxb_w(1);
 	m_vdp_int = 0; // V9958 reset clears its /INT output.
 	m_vdp_config = 0; // ~RESET clears the 74HC273.
 	update_irq();
@@ -223,7 +225,7 @@ void zephyr80_state::vdp_w(offs_t offset, u8 data)
 
 // /INT (IO board net `~{INT}`, bus CTRL_14, CPU pin 16) is a wired-OR of
 // open-drain requests with a backplane pull-up (RN7).  The daisy devices
-// (CTC, SIO0, SIO1) request only while their IEI is high, which the Z80 core
+// (CTC, SIO0) request only while their IEI is high, which the Z80 core
 // evaluates from the chain on every IRQ0 update.  So IRQ0 carries the level of
 // the sources outside the chain (the V9958) and every daisy change re-presents
 // it: the core then asserts the CPU line while any source requests, and no
@@ -266,13 +268,14 @@ IRQ_CALLBACK_MEMBER(zephyr80_state::unclaimed_ack)
 // IM2 daisy chain, highest priority first, from the IO board nets: bus CTRL_18
 // (backplane RN5 pull-up) -> `/IO Controller Card/IEI` -> CTC IEI;
 // `Net-(IC1-IEO)` CTC IEO -> SIO0 IEI; `Net-(IC2-IEO)` SIO0 IEO -> SIO1 IEI;
-// SIO1 IEO -> `/IO Controller Card/IEO` (bus CTRL_17, unused).  The V9958 is
-// outside the chain.
+// SIO1 IEO -> `/IO Controller Card/IEO` (bus CTRL_17, unused).  SIO1 is the
+// IO-controller link, polled with its interrupts disabled by both guests; its
+// model (zephyr80_sio1) has no interrupt logic and passes IEI to IEO.  The
+// V9958 is outside the chain.
 static const z80_daisy_config zephyr80_daisy[] =
 {
 	{ "ctc" },
 	{ "sio0" },
-	{ "sio1" },
 	{ nullptr }
 };
 
@@ -309,9 +312,12 @@ void zephyr80_state::zephyr80(machine_config &config)
 	sio0b_rs232.set_option_device_input_defaults("pty", DEVICE_INPUT_DEFAULTS_NAME(console_baud_115200));
 	sio0b_rs232.set_option_device_input_defaults("loopback", DEVICE_INPUT_DEFAULTS_NAME(console_baud_115200));
 
-	Z80SIO(config, m_sio1, 10_MHz_XTAL);
-	m_sio1->set_cputag(m_maincpu);
-	m_sio1->out_int_callback().set(FUNC(zephyr80_state::daisy_int_w));
+	// SIO1: the IO-controller link, both channels External Sync x1 lanes
+	// clocked by the controller (A bulk, B command).
+	ZEPHYR80_SIO1(config, m_sio1);
+	ZEPHYR80_IOC(config, m_ioc);
+	m_sio1->set_client(*m_ioc);
+	m_ioc->set_lane(*m_sio1);
 
 	// CTC: CLK is the 10 MHz bus clock (`CLK_10M`), so timer mode counts
 	// 10 MHz through the 16/256 prescaler.  CLK/TRG0-3 come from the 74HC4040
@@ -344,16 +350,6 @@ void zephyr80_state::zephyr80(machine_config &config)
 	// CTC TRG0; guests program x16, giving 115200 baud.
 	clock_device &sio0b_clock(CLOCK(config, "sio0b_clock", 14.7456_MHz_XTAL / 8));
 	sio0b_clock.signal_handler().set(m_sio0, FUNC(z80sio_device::rxtxcb_w));
-
-	// SIO1 is the IO-controller link.  These free-running clocks are
-	// placeholders that keep the unconnected channels shifting; they do not
-	// model the link's clocking.
-	clock_device &sio1a_clock(CLOCK(config, "sio1a_clock", 9'600 * 16));
-	sio1a_clock.signal_handler().set(m_sio1, FUNC(z80sio_device::rxca_w));
-	sio1a_clock.signal_handler().append(m_sio1, FUNC(z80sio_device::txca_w));
-
-	clock_device &sio1b_clock(CLOCK(config, "sio1b_clock", 9'600 * 16));
-	sio1b_clock.signal_handler().set(m_sio1, FUNC(z80sio_device::rxtxcb_w));
 }
 
 ROM_START(zephyr80)

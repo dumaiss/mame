@@ -65,6 +65,13 @@ function createProjects_mame_pbitz(_target, _subtarget)
 		MAME_DIR .. "src/mame/pbitz/zephyr80_map.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc_core.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc_core.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc_lane.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_sio1.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_sio1.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr_banktst.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr_siotop.cpp",
 	}
