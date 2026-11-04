@@ -1,0 +1,10 @@
+{
+	"plugin": {
+		"name": "konaos",
+		"description": "KonaOS on zephyr80: symbols, bank-aware breakpoints, physical memory, console capture, SDK runs",
+		"version": "1.0",
+		"author": "Kitamura",
+		"type": "plugin",
+		"start": "false"
+	}
+}

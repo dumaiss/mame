@@ -11,6 +11,10 @@
 #include "zephyr80_ioc_speed.h"
 #include "zephyr80_sio1.h"
 
+#include "debug/debugcpu.h"
+#include "debug/express.h"
+#include "debugger.h"
+
 #include "bus/rs232/loopback.h"
 #include "bus/rs232/pty.h"
 #include "bus/rs232/rs232.h"
@@ -25,6 +29,8 @@
 
 #include "screen.h"
 #include "speaker.h"
+
+#include "hashing.h"
 
 
 namespace {
@@ -72,6 +78,7 @@ public:
 		, m_psg(*this, "psg%u", 0U)
 		, m_dac(*this, "dac")
 		, m_flash(*this, "flash")
+		, m_ram(*this, "sram", zephyr80_map::mem::RAM_SIZE, ENDIANNESS_LITTLE)
 	{
 	}
 
@@ -80,6 +87,8 @@ public:
 protected:
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
+	virtual void device_pre_save() override ATTR_COLD;
+	virtual void device_post_load() override ATTR_COLD;
 
 private:
 	required_device<z80_device> m_maincpu;
@@ -95,7 +104,11 @@ private:
 	// The IO controller's SD socket; -card and -carddir insert its media.
 	zephyr80_card_socket m_card;
 
-	std::unique_ptr<u8[]> m_ram;
+	// The 512 KiB SRAM, physical address = bank << 16 | A15-A0.  As a memory
+	// share it is the debugger's `sram` memory view (and `addr:sram.s` in its
+	// commands) and Lua's manager.machine.memory.shares[":sram"]: every bank,
+	// whatever the latch maps.
+	memory_share_creator<u8> m_ram;
 	u8 m_latch = 0;
 
 	void mem_map(address_map &map) ATTR_COLD;
@@ -128,13 +141,62 @@ private:
 
 void zephyr80_state::machine_start()
 {
-	m_ram = std::make_unique<u8[]>(zephyr80_map::mem::RAM_SIZE);
-	std::fill_n(m_ram.get(), zephyr80_map::mem::RAM_SIZE, 0x00);
-
-	save_pointer(NAME(m_ram), zephyr80_map::mem::RAM_SIZE);
+	// The share is allocated zeroed and saved by the memory system.
 	save_item(NAME(m_latch));
 	save_item(NAME(m_vdp_int));
 	save_item(NAME(m_vdp_config));
+	m_card.save_state([this] (auto &&... item) { save_item(std::forward<decltype(item)>(item)...); });
+
+	// Debugger expressions: phys(a) is where logical address a reads (and an
+	// instruction there is fetched from) under the current latch, as the
+	// decoder selects it: SRAM bank << 16 | a, or 80000h + the flash address
+	// in mode 00.  Nothing is accessed, so it changes no latch or device
+	// status; a breakpoint condition such as `phys(pc) == 3815d` stops only in
+	// that physical bank.
+	if (machine().debug_flags & DEBUG_FLAG_ENABLED)
+	{
+		machine().debugger().cpu().global_symtable().add(
+				"phys", 1, 1,
+				[this] (int, u64 const *param) -> u64
+				{
+					auto const mapping = zephyr80_map::decode(u16(param[0]), m_latch);
+					return mapping.read_flash ? zephyr80_map::mem::RAM_SIZE + mapping.read_address : mapping.read_address;
+				});
+	}
+}
+
+// The card socket's media identity hash.
+class card_digest : public zephyr80_card_socket::digest
+{
+public:
+	virtual void append(void const *data, size_t length) override { m_hash.append(data, u32(length)); }
+	virtual std::array<u8, 20> finish() override
+	{
+		util::sha1_t const sum = m_hash.finish();
+		m_hash.reset();
+		std::array<u8, 20> out;
+		std::copy_n(sum.m_raw, out.size(), out.begin());
+		return out;
+	}
+
+private:
+	util::sha1_creator m_hash;
+};
+
+// The socket's host resources (files, the media identity) are not state:
+// they are recorded before a save and rebuilt, or refused, after a load.
+void zephyr80_state::device_pre_save()
+{
+	card_digest hash;
+	if (std::string const error = m_card.presave(hash); !error.empty())
+		throw emu_fatalerror("%s", error);
+}
+
+void zephyr80_state::device_post_load()
+{
+	card_digest hash;
+	if (std::string const error = m_card.postload(hash); !error.empty())
+		throw emu_fatalerror("%s", error);
 }
 
 void zephyr80_state::machine_reset()

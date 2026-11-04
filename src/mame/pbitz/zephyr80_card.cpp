@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <stdexcept>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -185,6 +186,8 @@ bool host_full(int error)
 extern "C" {
 
 FRESULT zephyr80_fatfs_sync_window(FATFS *fs);
+WORD zephyr80_fatfs_mount_id(void);
+void zephyr80_fatfs_set_mount_id(WORD id);
 
 DSTATUS zephyr80_card_disk_status(BYTE pdrv)
 {
@@ -246,8 +249,16 @@ zephyr80_card_socket::zephyr80_card_socket()
 	, m_fat_mounted(false)
 	, m_folder_mounted(false)
 	, m_fat(std::make_unique<fatfs_state>())
+	, m_saved_kind(0)
+	, m_saved_read_only(0)
+	, m_saved_bytes(0)
+	, m_saved_digest{}
+	, m_saved_serial(0)
+	, m_saved{}
 {
 	std::memset(&m_fat->fs, 0, sizeof(m_fat->fs));
+	std::memset(m_fat->fil.data(), 0, sizeof(m_fat->fil));
+	std::memset(m_fat->dir.data(), 0, sizeof(m_fat->dir));
 }
 
 zephyr80_card_socket::~zephyr80_card_socket()
@@ -1615,4 +1626,467 @@ zephyr80_card_socket::image_status zephyr80_card_socket::fatmap_resolve(u8 const
 		return image_status::NO_FS;
 	o.extent_count = n;
 	return image_status::OK;
+}
+
+
+//**************************************************************************
+//  Save states
+//**************************************************************************
+
+// The FatFs configuration the pointer-free form below assumes: one 512-byte
+// window, no LFN buffer, no exFAT, 32-bit sectors and sizes, writable.
+#if FF_FS_TINY != 1 || FF_USE_LFN != 0 || FF_FS_EXFAT != 0 || FF_LBA64 != 0 || FF_FS_READONLY != 0 || FF_MAX_SS != 512 || FF_MIN_SS != 512 || FF_FS_RPATH != 0 || FF_FS_LOCK != 0
+#error "zephyr80_card.cpp: the save-state form needs FF_FS_TINY 1, FF_USE_LFN 0, FF_FS_EXFAT 0, FF_LBA64 0, a 512-byte sector, no RPATH and no LOCK"
+#endif
+
+namespace {
+
+// Why a state cannot be saved or restored; presave() and postload() return
+// its text.
+struct state_error : std::runtime_error
+{
+	using std::runtime_error::runtime_error;
+};
+
+// Little-endian fields in the socket's saved bytes.
+class saved_writer
+{
+public:
+	saved_writer(u8 *data, size_t capacity) : m_data(data), m_capacity(capacity), m_at(0) { }
+	void put(u64 value, unsigned bytes)
+	{
+		room(bytes);
+		for (unsigned i = 0; i < bytes; i++)
+			m_data[m_at++] = u8(value >> (8 * i));
+	}
+	void bytes(void const *src, size_t length)
+	{
+		room(length);
+		std::memcpy(&m_data[m_at], src, length);
+		m_at += length;
+	}
+	void finish() { std::fill(&m_data[m_at], &m_data[m_capacity], 0); }
+
+private:
+	void room(size_t length) const
+	{
+		if (m_at + length > m_capacity)
+			throw state_error("card socket: the open objects need more than " + std::to_string(m_capacity) + " bytes of state");
+	}
+
+	u8 *m_data;
+	size_t m_capacity;
+	size_t m_at;
+};
+
+class saved_reader
+{
+public:
+	saved_reader(u8 const *data, size_t capacity) : m_data(data), m_capacity(capacity), m_at(0) { }
+	u64 get(unsigned bytes)
+	{
+		need(bytes);
+		u64 value = 0;
+		for (unsigned i = 0; i < bytes; i++)
+			value |= u64(m_data[m_at++]) << (8 * i);
+		return value;
+	}
+	void bytes(void *dst, size_t length)
+	{
+		need(length);
+		std::memcpy(dst, &m_data[m_at], length);
+		m_at += length;
+	}
+
+private:
+	void need(size_t length) const
+	{
+		if (m_at + length > m_capacity)
+			throw state_error("card socket: the saved state is truncated");
+	}
+
+	u8 const *m_data;
+	size_t m_capacity;
+	size_t m_at;
+};
+
+// A FatFs pointer into the window as an offset: FFFFh for none, FFFEh for one
+// outside the window (which no restore can rebuild).
+constexpr u16 NO_POINTER = 0xffff;
+constexpr u16 FOREIGN_POINTER = 0xfffe;
+
+u16 window_offset(FATFS const &fs, BYTE const *p)
+{
+	if (!p)
+		return NO_POINTER;
+	if (p < fs.win || p >= fs.win + sizeof(fs.win))
+		return FOREIGN_POINTER;
+	return u16(p - fs.win);
+}
+
+BYTE *window_pointer(FATFS &fs, u16 offset)
+{
+	if (offset == NO_POINTER)
+		return nullptr;
+	if (offset >= sizeof(fs.win))
+		throw state_error("card socket: a saved FatFs object points outside its window and cannot be rebuilt");
+	return fs.win + offset;
+}
+
+void put_object(saved_writer &w, FATFS const &fs, FFOBJID const &obj)
+{
+	if (obj.fs && obj.fs != &fs)
+		throw state_error("card socket: a FatFs object belongs to another volume");
+	w.put(obj.fs ? 1 : 0, 1);
+	w.put(obj.id, 2);
+	w.put(obj.attr, 1);
+	w.put(obj.stat, 1);
+	w.put(obj.sclust, 4);
+	w.put(obj.objsize, 4);
+}
+
+void get_object(saved_reader &r, FATFS &fs, FFOBJID &obj)
+{
+	obj.fs = r.get(1) ? &fs : nullptr;
+	obj.id = WORD(r.get(2));
+	obj.attr = BYTE(r.get(1));
+	obj.stat = BYTE(r.get(1));
+	obj.sclust = DWORD(r.get(4));
+	obj.objsize = FSIZE_t(r.get(4));
+}
+
+void hash_u64(zephyr80_card_socket::digest &hash, u64 value)
+{
+	u8 b[8];
+	for (unsigned i = 0; i < 8; i++)
+		b[i] = u8(value >> (8 * i));
+	hash.append(b, 8);
+}
+
+// A host file's bytes; false when it cannot be read.
+bool hash_file(zephyr80_card_socket::digest &hash, std::FILE *f)
+{
+	std::vector<u8> chunk(1 << 20);
+	if (!seek_to(f, 0))
+		return false;
+	for (;;)
+	{
+		size_t const n = std::fread(chunk.data(), 1, chunk.size(), f);
+		if (n)
+			hash.append(chunk.data(), n);
+		if (n < chunk.size())
+			break;
+	}
+	bool const ok = !std::ferror(f);
+	std::clearerr(f);
+	return ok;
+}
+
+} // anonymous namespace
+
+// The folder as the card presents it, depth first in 8.3 order: each name,
+// its kind, ambiguity and write permission, then a file's size and bytes or
+// a directory's own tree.
+void zephyr80_card_socket::hash_folder(fs::path const &dir, digest &hash) const
+{
+	std::vector<host_entry> listing;
+	if (host_list(dir, listing) != fr::OK)
+	{
+		hash.append("?", 1);
+		return;
+	}
+	for (host_entry const &e : listing)
+	{
+		u8 const flags = (e.dir ? 1 : 0) | (e.ambiguous ? 2 : 0) | (owner_writable(e.host) ? 4 : 0);
+		hash.append(e.sfn.data(), e.sfn.size());
+		hash.append(&flags, 1);
+		if (e.dir)
+		{
+			hash_folder(e.host, hash);
+			hash.append("/", 1);
+			continue;
+		}
+		std::error_code ec;
+		u64 const length = fs::file_size(e.host, ec);
+		hash_u64(hash, ec ? ~u64(0) : length);
+		std::FILE *f = std::fopen(e.host.string().c_str(), "rb");
+		if (!f || !hash_file(hash, f))
+			hash.append("?", 1);
+		if (f)
+			std::fclose(f);
+	}
+}
+
+zephyr80_card_socket::identity zephyr80_card_socket::identify(digest &hash) const
+{
+	identity id{};
+	if (!m_media)
+		return id;
+	id.read_only = m_media->read_only ? 1 : 0;
+	if (m_media->type == kind::IMAGE)
+	{
+		id.kind = 1;
+		std::error_code ec;
+		id.bytes = fs::file_size(m_media->path, ec);
+		if (ec || !hash_file(hash, m_media->file))
+			throw state_error("card socket: cannot read card image " + m_media->path.string() + " to identify it");
+	}
+	else
+	{
+		id.kind = 2;
+		hash_folder(m_media->path, hash);
+	}
+	id.digest = hash.finish();
+	return id;
+}
+
+std::string zephyr80_card_socket::describe(identity const &id)
+{
+	if (!id.kind)
+		return "an empty socket";
+	std::string sum;
+	for (u8 b : id.digest)
+	{
+		char hex[3];
+		std::snprintf(hex, sizeof(hex), "%02x", b);
+		sum += hex;
+	}
+	std::string const protect = id.read_only ? " (read-only)" : "";
+	if (id.kind == 1)
+		return "a " + std::to_string(id.bytes) + "-byte card image" + protect + ", SHA-1 " + sum;
+	return "a card folder" + protect + ", SHA-1 " + sum;
+}
+
+// Before a save: the media identity, then every object with its file as a
+// path below the media root, then FatFs's volume and objects.
+std::string zephyr80_card_socket::presave(digest &hash)
+{
+	try
+	{
+		identity const id = identify(hash);
+		m_saved_kind = id.kind;
+		m_saved_read_only = id.read_only;
+		m_saved_bytes = id.bytes;
+		m_saved_digest = id.digest;
+		m_saved_serial = m_media ? m_media->serial : 0;
+
+		saved_writer w(m_saved.data(), m_saved.size());
+		for (objslot const &o : m_objects)
+		{
+			w.put(u8(o.type), 1);
+			w.put(o.valid ? 1 : 0, 1);
+			w.put(o.writable ? 1 : 0, 1);
+			w.put(o.serial, 4);
+			w.put(o.position, 8);
+			w.put(o.length, 8);
+			w.put(o.next, 4);
+			w.put(o.extent_count, 1);
+			for (extent const &e : o.extents)
+			{
+				w.put(e.start, 4);
+				w.put(e.blocks, 4);
+			}
+			// A host object on the inserted folder: its path from the root.
+			std::string path;
+			if (!o.host.empty() && m_media && m_media->type == kind::FOLDER && o.serial == m_media->serial)
+				path = o.host.lexically_relative(m_media->path).generic_string();
+			w.put(path.size(), 2);
+			w.bytes(path.data(), path.size());
+			// A folder directory's names are fixed when it was opened: the
+			// ones still to be read, as host names.
+			size_t const first = path.empty() ? o.listing.size() : std::min(o.next, o.listing.size());
+			w.put(o.listing.size() - first, 2);
+			for (size_t i = first; i < o.listing.size(); i++)
+			{
+				host_entry const &e = o.listing[i];
+				std::string const name = e.host.filename().string();
+				w.bytes(e.sfn.data(), e.sfn.size());
+				w.put(e.dir ? 1 : 0, 1);
+				w.put(name.size(), 1);
+				w.bytes(name.data(), name.size());
+			}
+		}
+
+		FATFS const &fs = m_fat->fs;
+		w.put(zephyr80_fatfs_mount_id(), 2);
+		w.put(fs.fs_type, 1);
+		w.put(fs.pdrv, 1);
+		w.put(fs.ldrv, 1);
+		w.put(fs.n_fats, 1);
+		w.put(fs.wflag, 1);
+		w.put(fs.fsi_flag, 1);
+		w.put(fs.id, 2);
+		w.put(fs.n_rootdir, 2);
+		w.put(fs.csize, 2);
+		w.put(fs.last_clst, 4);
+		w.put(fs.free_clst, 4);
+		w.put(fs.n_fatent, 4);
+		w.put(fs.fsize, 4);
+		w.put(fs.volbase, 4);
+		w.put(fs.fatbase, 4);
+		w.put(fs.dirbase, 4);
+		w.put(fs.database, 4);
+		w.put(fs.winsect, 4);
+		w.bytes(fs.win, sizeof(fs.win));
+		for (FIL const &f : m_fat->fil)
+		{
+			if (f.cltbl)
+				throw state_error("card socket: a FatFs file holds a cluster link map, which a state cannot carry");
+			put_object(w, fs, f.obj);
+			w.put(f.flag, 1);
+			w.put(f.err, 1);
+			w.put(f.fptr, 4);
+			w.put(f.clust, 4);
+			w.put(f.sect, 4);
+			w.put(f.dir_sect, 4);
+			w.put(window_offset(fs, f.dir_ptr), 2);
+		}
+		for (DIR const &d : m_fat->dir)
+		{
+			put_object(w, fs, d.obj);
+			w.put(d.dptr, 4);
+			w.put(d.clust, 4);
+			w.put(d.sect, 4);
+			w.put(window_offset(fs, d.dir), 2);
+			w.bytes(d.fn, sizeof(d.fn));
+		}
+		w.finish();
+	}
+	catch (state_error const &e)
+	{
+		return e.what();
+	}
+	return std::string();
+}
+
+// After a load: the inserted media must be those saved; then the objects
+// get their host files again and FatFs its volume table entry and pointers.
+std::string zephyr80_card_socket::postload(digest &hash)
+{
+	try
+	{
+		identity saved{};
+		saved.kind = m_saved_kind;
+		saved.read_only = m_saved_read_only;
+		saved.bytes = m_saved_bytes;
+		saved.digest = m_saved_digest;
+		identity const inserted = identify(hash);
+		if (saved.kind != inserted.kind || saved.read_only != inserted.read_only || saved.bytes != inserted.bytes || saved.digest != inserted.digest)
+			throw state_error("card socket: the state was saved with " + describe(saved) + ", but the socket holds " + describe(inserted) +
+					"; restore it with the media exactly as they were when it was saved");
+		if (m_media)
+			m_media->serial = m_saved_serial;
+
+		// What the running socket held is replaced, not flushed.
+		for (object id = 0; id < OBJECTS; id++)
+			release(id);
+		if (s_fatfs_owner == this)
+		{
+			f_mount(nullptr, "", 0);
+			s_fatfs_owner = nullptr;
+		}
+
+		saved_reader r(m_saved.data(), m_saved.size());
+		for (objslot &o : m_objects)
+		{
+			u8 const type = u8(r.get(1));
+			if (type > u8(slot::IMAGE_HOST))
+				throw state_error("card socket: the saved state names an unknown object type " + std::to_string(type));
+			o.type = slot(type);
+			o.valid = r.get(1) != 0;
+			o.writable = r.get(1) != 0;
+			o.serial = u32(r.get(4));
+			o.position = r.get(8);
+			o.length = r.get(8);
+			o.next = size_t(r.get(4));
+			o.extent_count = u8(r.get(1));
+			for (extent &e : o.extents)
+			{
+				e.start = u32(r.get(4));
+				e.blocks = u32(r.get(4));
+			}
+			std::string path(size_t(r.get(2)), '\0');
+			r.bytes(path.data(), path.size());
+			o.file = nullptr;
+			o.host.clear();
+			o.listing.clear();
+			if (!path.empty())
+				o.host = (m_media->path / fs::path(path)).lexically_normal();
+			size_t const left = size_t(r.get(2));
+			for (size_t i = 0; i < left; i++)
+			{
+				host_entry e;
+				r.bytes(e.sfn.data(), e.sfn.size());
+				e.dir = r.get(1) != 0;
+				std::string name(size_t(r.get(1)), '\0');
+				r.bytes(name.data(), name.size());
+				e.host = o.host / name;
+				e.ambiguous = false;
+				o.listing.push_back(std::move(e));
+			}
+			if (!path.empty())
+				o.next = 0;
+			// A host file on the folder: reopen it where it was.
+			if (!path.empty() && (o.type == slot::HOST_FILE || o.type == slot::IMAGE_HOST))
+			{
+				o.file = open_file(o.host, o.writable);
+				if (!o.file)
+					throw state_error("card socket: cannot reopen " + o.host.string() + " for the restored state: " + std::strerror(errno));
+			}
+		}
+
+		FATFS &fs = m_fat->fs;
+		if (m_fat_mounted)
+		{
+			// f_mount registers the volume and clears it; the saved one follows.
+			s_fatfs_owner = this;
+			f_mount(&fs, "", 0);
+		}
+		zephyr80_fatfs_set_mount_id(WORD(r.get(2)));
+		fs.fs_type = BYTE(r.get(1));
+		fs.pdrv = BYTE(r.get(1));
+		fs.ldrv = BYTE(r.get(1));
+		fs.n_fats = BYTE(r.get(1));
+		fs.wflag = BYTE(r.get(1));
+		fs.fsi_flag = BYTE(r.get(1));
+		fs.id = WORD(r.get(2));
+		fs.n_rootdir = WORD(r.get(2));
+		fs.csize = WORD(r.get(2));
+		fs.last_clst = DWORD(r.get(4));
+		fs.free_clst = DWORD(r.get(4));
+		fs.n_fatent = DWORD(r.get(4));
+		fs.fsize = DWORD(r.get(4));
+		fs.volbase = LBA_t(r.get(4));
+		fs.fatbase = LBA_t(r.get(4));
+		fs.dirbase = LBA_t(r.get(4));
+		fs.database = LBA_t(r.get(4));
+		fs.winsect = LBA_t(r.get(4));
+		r.bytes(fs.win, sizeof(fs.win));
+		for (FIL &f : m_fat->fil)
+		{
+			get_object(r, fs, f.obj);
+			f.flag = BYTE(r.get(1));
+			f.err = BYTE(r.get(1));
+			f.fptr = FSIZE_t(r.get(4));
+			f.clust = DWORD(r.get(4));
+			f.sect = LBA_t(r.get(4));
+			f.dir_sect = LBA_t(r.get(4));
+			f.dir_ptr = window_pointer(fs, u16(r.get(2)));
+			f.cltbl = nullptr;
+		}
+		for (DIR &d : m_fat->dir)
+		{
+			get_object(r, fs, d.obj);
+			d.dptr = DWORD(r.get(4));
+			d.clust = DWORD(r.get(4));
+			d.sect = LBA_t(r.get(4));
+			d.dir = window_pointer(fs, u16(r.get(2)));
+			r.bytes(d.fn, sizeof(d.fn));
+		}
+	}
+	catch (state_error const &e)
+	{
+		return e.what();
+	}
+	return std::string();
 }

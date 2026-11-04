@@ -36,6 +36,16 @@
 // Bounds: at most 16 objects (files, directories, volume images) at once;
 // one 512-byte FatFs window (FF_FS_TINY); transfers read and write only the
 // bytes asked for.
+//
+// Save states.  The socket's session, mount, objects and FatFs state are
+// saved without host pointers or files: an object's file is its path below
+// the media root, FatFs's pointers are offsets into its window.  The media
+// are not copied.  A state records their identity instead: the kind (none,
+// image, folder), write protection, an image's size and a SHA-1 of what the
+// card presents (an image's bytes; a folder's 8.3 tree, each name, kind,
+// write permission, size and contents).  Restoring checks the inserted media
+// against it and then reopens the files; any difference is a fatal error,
+// so nothing saved is ever replayed onto changed media.
 class zephyr80_card_socket : public zephyr80_ioc_storage
 {
 public:
@@ -50,6 +60,26 @@ public:
 	std::string insert_folder(std::string const &path);
 	void eject();
 	bool inserted() const { return bool(m_media); }
+
+	// Save states.  The media identity's hash (SHA-1) is the machine's:
+	// append bytes, then finish() gives the 20-byte digest and starts over.
+	class digest
+	{
+	public:
+		virtual void append(void const *data, size_t length) = 0;
+		virtual std::array<u8, 20> finish() = 0;
+
+	protected:
+		~digest() = default;
+	};
+
+	// Register the state (save(item, name) per member); record the host
+	// resources before a save; check and rebuild them after a load.  Both
+	// return an empty string, or why the state cannot be saved or restored
+	// (the media differ, a file cannot be reopened).
+	template <typename Save> void save_state(Save &&save);
+	std::string presave(digest &hash);
+	std::string postload(digest &hash);
 
 	// zephyr80_ioc_storage
 	virtual card card_init() override;
@@ -91,6 +121,7 @@ public:
 
 	static constexpr unsigned OBJECTS = 16;
 	static constexpr unsigned IMAGE_EXTENTS = 16;   // VOL_MAX_EXTENTS
+	static constexpr unsigned SAVED_BYTES = 65536;  // the pointer-free objects and FatFs state
 
 private:
 	enum class kind : u8 { IMAGE, FOLDER };
@@ -168,6 +199,18 @@ private:
 	// Card images: fatmap_resolve
 	image_status fatmap_resolve(u8 const *dir11, u8 const *name11, u32 bytes, objslot &o);
 
+	// Save states
+	struct identity
+	{
+		u8 kind;                      // 0 no media, 1 image, 2 folder
+		u8 read_only;
+		u64 bytes;                    // image size
+		std::array<u8, 20> digest;
+	};
+	identity identify(digest &hash) const;
+	void hash_folder(std::filesystem::path const &dir, digest &hash) const;
+	static std::string describe(identity const &id);
+
 	std::unique_ptr<media> m_media;
 	u32 m_next_serial;
 	bool m_ready;          // card_ready
@@ -177,6 +220,30 @@ private:
 	struct fatfs_state;                   // FatFs's FATFS, FIL and DIR objects
 	std::unique_ptr<fatfs_state> m_fat;
 	std::array<objslot, OBJECTS> m_objects;
+
+	// What a state carries for the host side (presave, postload).
+	u8 m_saved_kind;
+	u8 m_saved_read_only;
+	u64 m_saved_bytes;
+	std::array<u8, 20> m_saved_digest;
+	u32 m_saved_serial;                    // the media's insertion serial
+	std::array<u8, SAVED_BYTES> m_saved;   // objects and FatFs, pointer-free
 };
+
+template <typename Save>
+void zephyr80_card_socket::save_state(Save &&save)
+{
+	save(m_next_serial, "card.m_next_serial");
+	save(m_ready, "card.m_ready");
+	save(m_replaced, "card.m_replaced");
+	save(m_fat_mounted, "card.m_fat_mounted");
+	save(m_folder_mounted, "card.m_folder_mounted");
+	save(m_saved_kind, "card.m_saved_kind");
+	save(m_saved_read_only, "card.m_saved_read_only");
+	save(m_saved_bytes, "card.m_saved_bytes");
+	save(m_saved_digest, "card.m_saved_digest");
+	save(m_saved_serial, "card.m_saved_serial");
+	save(m_saved, "card.m_saved");
+}
 
 #endif // MAME_PBITZ_ZEPHYR80_CARD_H
