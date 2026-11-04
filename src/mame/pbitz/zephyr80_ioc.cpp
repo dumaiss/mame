@@ -82,8 +82,17 @@ zephyr80_ioc_device::zephyr80_ioc_device(const machine_config &mconfig, const ch
 	, m_speed(nullptr)
 	, m_fast(false)
 	, m_core(*this)
+	, m_keyboard(*this, "keyboard")
 	, m_command_timer(nullptr)
+	, m_hid_timer(nullptr)
+	, m_kbd_pending(false)
 {
+}
+
+void zephyr80_ioc_device::device_add_mconfig(machine_config &config)
+{
+	ZEPHYR80_USB_KEYBOARD(config, m_keyboard);
+	m_keyboard->set_host(*this);
 }
 
 void zephyr80_ioc_device::device_start()
@@ -96,6 +105,7 @@ void zephyr80_ioc_device::device_start()
 		throw emu_fatalerror("%s: no ioc_speed slot attached", tag());
 	m_fast = m_speed->fast();
 	m_command_timer = timer_alloc(FUNC(zephyr80_ioc_device::command_step), this);
+	m_hid_timer = timer_alloc(FUNC(zephyr80_ioc_device::hid_tick), this);
 
 	m_core.save_state([this] (auto &&... item) { save_item(std::forward<decltype(item)>(item)...); });
 	save_item(NAME(m_phase));
@@ -112,6 +122,9 @@ void zephyr80_ioc_device::device_start()
 	save_item(NAME(m_bulk_count));
 	save_item(NAME(m_bulk_total));
 	save_item(NAME(m_bulk));
+	save_item(NAME(m_hid_epoch));
+	save_item(NAME(m_kbd_report));
+	save_item(NAME(m_kbd_pending));
 }
 
 // The controller restarts with the board: no service in flight, both /SYNC
@@ -132,6 +145,12 @@ void zephyr80_ioc_device::device_reset()
 	std::fill(std::begin(m_reply), std::end(m_reply), 0);
 	std::fill(std::begin(m_bulk), std::end(m_bulk), 0);
 	m_core.reset();
+	// Enumeration is not modelled: the keyboard is mounted with the reset.
+	m_core.hid().mount();
+	m_hid_epoch = machine().time();
+	m_hid_timer->adjust(attotime::never);
+	std::fill(std::begin(m_kbd_report), std::end(m_kbd_report), 0);
+	m_kbd_pending = false;
 	resync_lanes();
 	m_lane->lane_cts(COMMAND, false);
 	m_lane->lane_dcd(BULK, false);
@@ -159,6 +178,61 @@ void zephyr80_ioc_device::host_reset()
 {
 	m_phase = RESETTING;
 	m_command_timer->adjust(attotime::from_msec(HOST_RESET_MS));
+}
+
+// The latest report waits for the idle pass; a boot keyboard's report is a
+// state, so a newer one replaces an older one still waiting.
+void zephyr80_ioc_device::keyboard_report(u8 const *report, unsigned length)
+{
+	std::fill(std::begin(m_kbd_report), std::end(m_kbd_report), 0);
+	std::copy_n(report, std::min<unsigned>(length, std::size(m_kbd_report)), m_kbd_report);
+	m_kbd_pending = true;
+	if (m_phase == IDLE)
+		hid_service();
+}
+
+// tusb_time_millis_api: whole 10 ms timebase ticks since the controller's reset.
+u32 zephyr80_ioc_device::hid_now_ms() const
+{
+	return u32((machine().time() - m_hid_epoch).as_ticks(1000 / zephyr80_ioc_hid::TICK_MS)) * zephyr80_ioc_hid::TICK_MS;
+}
+
+// hid_host_task in the idle pass: the waiting report (tuh_task), the repeat,
+// then hid_reset_requested.  The timer is set for the repeat's due tick.
+void zephyr80_ioc_device::hid_service()
+{
+	zephyr80_ioc_hid &hid = m_core.hid();
+	u32 const now = hid_now_ms();
+	if (m_kbd_pending)
+	{
+		m_kbd_pending = false;
+		hid.report(m_kbd_report, std::size(m_kbd_report), now);
+	}
+	hid.task(now);
+	if (hid.reset_requested())
+	{
+		m_hid_timer->adjust(attotime::never);
+		set_ready(false);
+		host_reset();
+		return;
+	}
+	u32 due;
+	if (hid.repeat_due(due))
+	{
+		attotime const at = m_hid_epoch + attotime::from_msec(due);
+		m_hid_timer->adjust(at > machine().time() ? at - machine().time() : attotime::zero);
+	}
+	else
+	{
+		m_hid_timer->adjust(attotime::never);
+	}
+}
+
+// The repeat's tick: served now when idle, else by the service's end.
+TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::hid_tick)
+{
+	if (m_phase == IDLE)
+		hid_service();
 }
 
 void zephyr80_ioc_device::set_ready(bool ready)
@@ -285,10 +359,14 @@ void zephyr80_ioc_device::after_reply()
 	bulk_step();
 }
 
-// The service's last step: READY returns after the controller's idle pass.
+// The service's last step: READY returns after the controller's idle pass
+// (hid_host_task, then the volume service).
 void zephyr80_ioc_device::end_service()
 {
 	m_phase = IDLE;
+	hid_service();
+	if (m_phase != IDLE)
+		return; // Ctrl+Alt+Esc: the reset follows
 	m_core.idle();
 	set_ready(true);
 	poll_request();

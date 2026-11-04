@@ -276,6 +276,10 @@ constexpr u8 IOC_HID_STATUS_PAYLOAD_LEN = 26;
 constexpr u8 IOC_HID_GAMEPAD_PAYLOAD_LEN = 26;
 constexpr u8 IOC_HID_OTHER_PAYLOAD_LEN = 21;
 constexpr unsigned IOC_OFF_HID_USB_INT = OFF_PAYLOAD + 2;
+constexpr unsigned IOC_OFF_HID_DEV_COUNT = OFF_PAYLOAD + 13;
+constexpr unsigned IOC_OFF_HID_KBD_ADDR = OFF_PAYLOAD + 14;
+constexpr unsigned IOC_OFF_HID_REPORTS = OFF_PAYLOAD + 15;      // LO, HI
+constexpr unsigned IOC_OFF_HID_LAST_REPORT = OFF_PAYLOAD + 17;  // 8 bytes
 constexpr unsigned IOC_OFF_HID_KBD_SPEED = OFF_PAYLOAD + 25;
 constexpr u8 IOC_HID_INPUT_META_LEN = 2;
 constexpr u8 IOC_HID_MOUSE_PAYLOAD_LEN = 9;
@@ -492,6 +496,7 @@ zephyr80_ioc_core::zephyr80_ioc_core(link &transport)
 	, m_storage(nullptr)
 	, m_calls(0)
 	, m_aborts(0)
+	, m_hid(transport)
 {
 }
 
@@ -545,9 +550,7 @@ void zephyr80_ioc_core::reset()
 	fs2_root_path();
 	m_generation = 1;
 
-	m_hid_queue.fill(0);
-	m_hid_head = m_hid_tail = m_hid_count = m_hid_dropped = 0;
-	m_link.hid_doorbell(false);
+	m_hid.reset();
 	m_mouse_flags = m_mouse_buttons = m_mouse_pressed = 0;
 	m_mouse_dx = m_mouse_dy = m_mouse_wheel = 0;
 }
@@ -2068,8 +2071,11 @@ void zephyr80_ioc_core::fs2_truncate(frame const &request, frame &reply)
 
 // Page 0 is the passive status; pages 6 and 7 are the passive gamepad and
 // second-interface pages; every other page answers page 0 (normal profile).
-// No USB host controller exists in this model: the bring-up result is
-// HID_HOST_NOT_STARTED with revision 0, /USB_INT idle, nothing mounted.
+// No USB host controller is modelled, so the bring-up fields say no probe
+// ran: HID_HOST_NOT_STARTED, revision 0, /USB_INT idle.  The live USB fields
+// (hid_host_usb_state) describe the HID module's keyboard: one device at
+// its address, the reports received since the mount, the last report and
+// full speed; with no keyboard mounted, none, 0 and speed FFh.
 void zephyr80_ioc_core::hid_status(frame const &request, frame &reply) const
 {
 	u8 const page = request[IOC_OFF_HID_REQ_PAGE];
@@ -2100,7 +2106,11 @@ void zephyr80_ioc_core::hid_status(frame const &request, frame &reply) const
 	}
 	reply_init(request, reply, RSP_HID_STATUS, IOC_STATUS_OK, IOC_HID_STATUS_PAYLOAD_LEN);
 	reply[IOC_OFF_HID_USB_INT] = 1;
-	reply[IOC_OFF_HID_KBD_SPEED] = 0xff;
+	reply[IOC_OFF_HID_DEV_COUNT] = m_hid.device_count();
+	reply[IOC_OFF_HID_KBD_ADDR] = m_hid.keyboard_address();
+	put16(&reply[IOC_OFF_HID_REPORTS], m_hid.report_count());
+	std::copy_n(m_hid.last_report(), zephyr80_ioc_hid::REPORT, &reply[IOC_OFF_HID_LAST_REPORT]);
+	reply[IOC_OFF_HID_KBD_SPEED] = m_hid.speed();
 }
 
 // handler_hid_input: up to `wanted` (at most 24) queued bytes, then the
@@ -2108,35 +2118,12 @@ void zephyr80_ioc_core::hid_status(frame const &request, frame &reply) const
 void zephyr80_ioc_core::hid_input(frame const &request, frame &reply)
 {
 	unsigned wanted = std::min<unsigned>(request[OFF_PAYLOAD], MAX_DATA - IOC_HID_INPUT_META_LEN);
-	unsigned const count = std::min<unsigned>(m_hid_count, wanted);
+	unsigned const count = std::min<unsigned>(m_hid.queued(), wanted);
 	reply_init(request, reply, RSP_HID_INPUT, IOC_STATUS_OK, u8(IOC_HID_INPUT_META_LEN + count));
 	for (unsigned i = 0; i < count; i++)
-	{
-		reply[OFF_PAYLOAD + 2 + i] = m_hid_queue[m_hid_tail];
-		m_hid_tail = (m_hid_tail + 1) % HID_QUEUE;
-		m_hid_count--;
-	}
-	reply[OFF_PAYLOAD + 0] = m_hid_count;
-	reply[OFF_PAYLOAD + 1] = m_hid_dropped;
-	m_link.hid_doorbell(m_hid_count != 0);
-}
-
-bool zephyr80_ioc_core::hid_input_put(u8 const *bytes, unsigned length)
-{
-	if (HID_QUEUE - m_hid_count < length)
-	{
-		if (m_hid_dropped != 0xff)
-			m_hid_dropped++;
-		return false;
-	}
-	for (unsigned i = 0; i < length; i++)
-	{
-		m_hid_queue[m_hid_head] = bytes[i];
-		m_hid_head = (m_hid_head + 1) % HID_QUEUE;
-		m_hid_count++;
-	}
-	m_link.hid_doorbell(m_hid_count != 0);
-	return true;
+		reply[OFF_PAYLOAD + 2 + i] = m_hid.get();
+	reply[OFF_PAYLOAD + 0] = m_hid.queued();
+	reply[OFF_PAYLOAD + 1] = m_hid.dropped();
 }
 
 // handler_hid_mouse / hid_mouse_take: motion and presses since the last

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "zephyr80_ioc_hid.h"
 #include "zephyr80_ioc_storage.h"
 
 #include <array>
@@ -38,7 +39,9 @@
 // only after it completed.
 //
 // Media come from a zephyr80_ioc_storage backend, the card socket; an empty
-// socket answers as the firmware does with no card in it.
+// socket answers as the firmware does with no card in it.  Keyboard input is
+// the HID module (zephyr80_ioc_hid): HID_INPUT drains its queue and
+// HID_STATUS page 0 reports its keyboard.
 class zephyr80_ioc_core
 {
 public:
@@ -53,12 +56,12 @@ public:
 	static constexpr unsigned BULK_WIRE_MAX = 2 + 2 + 3 + BULK_MAX + 2;
 	static constexpr unsigned BULK_SEARCH = 16;        // BULK_RX_SEARCH_BITS / 8
 	static constexpr unsigned BULK_WINDOW_MAX = BULK_MAX + (2 + 2 + 3 + 2) + BULK_SEARCH + 2; // BULK_RX_WINDOW_BYTES
-	static constexpr unsigned HID_QUEUE = 128;         // HID_INPUT_QUEUE_SIZE
 	static constexpr unsigned RESOLVER_MAX = 239;          // FS2_PATH_MAX
 	static constexpr unsigned VOL_UNITS = 2;
 
-	// What the protocol asks of the transport it runs on.
-	class link
+	// What the protocol asks of the transport it runs on, including /CTSB,
+	// the HID input doorbell (zephyr80_ioc_hid::doorbell).
+	class link : public zephyr80_ioc_hid::doorbell
 	{
 	public:
 		// Both lanes drop their character boundary: the next transfer on
@@ -67,8 +70,6 @@ public:
 		virtual void resync_lanes() = 0;
 		// The command lane's boundary is established (PING reports it).
 		virtual bool command_lane_synced() const = 0;
-		// /CTSB, the HID input doorbell: asserted while the queue holds bytes.
-		virtual void hid_doorbell(bool asserted) = 0;
 		// CMD_RESET (handler_reset): reset the machine; no reply follows.
 		virtual void host_reset() = 0;
 
@@ -111,9 +112,9 @@ public:
 	bool run_next();                               // arm a run's next packet
 	void run_end() { m_run_length = 0; }
 
-	// The HID input queue (ioc_hid.c input_reserve/input_put): a key's bytes
-	// enter whole or not at all; a refusal counts one drop.
-	bool hid_input_put(u8 const *bytes, unsigned length);
+	// The HID module: keyboard reports, the repeat and the input queue.
+	zephyr80_ioc_hid &hid() { return m_hid; }
+	zephyr80_ioc_hid const &hid() const { return m_hid; }
 
 	static u16 crc16(u16 crc, u8 data);
 
@@ -283,12 +284,8 @@ private:
 	u8 m_resolver_components;
 	u32 m_generation;
 
-	// HID (ioc_hid.c): the input queue and the mouse read state
-	std::array<u8, HID_QUEUE> m_hid_queue;
-	u8 m_hid_head;
-	u8 m_hid_tail;
-	u8 m_hid_count;
-	u8 m_hid_dropped;
+	// HID (ioc_hid.c): the keyboard and its input queue; the mouse read state
+	zephyr80_ioc_hid m_hid;
 	u8 m_mouse_flags;
 	u8 m_mouse_buttons;
 	u8 m_mouse_pressed;
@@ -356,11 +353,7 @@ void zephyr80_ioc_core::save_state(Save &&save)
 	save(m_resolver, "core.m_resolver");
 	save(m_resolver_components, "core.m_resolver_components");
 	save(m_generation, "core.m_generation");
-	save(m_hid_queue, "core.m_hid_queue");
-	save(m_hid_head, "core.m_hid_head");
-	save(m_hid_tail, "core.m_hid_tail");
-	save(m_hid_count, "core.m_hid_count");
-	save(m_hid_dropped, "core.m_hid_dropped");
+	m_hid.save_state(save);
 	save(m_mouse_flags, "core.m_mouse_flags");
 	save(m_mouse_buttons, "core.m_mouse_buttons");
 	save(m_mouse_pressed, "core.m_mouse_pressed");

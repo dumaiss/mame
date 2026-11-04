@@ -8,6 +8,7 @@
 #include "zephyr80_ioc_core.h"
 #include "zephyr80_ioc_lane.h"
 #include "zephyr80_ioc_speed.h"
+#include "zephyr80_usb_keyboard.h"
 
 // The IO controller as the Z80 sees it through SIO1: a behavioural model of
 // the firmware's transport (Code/MCU/IOController src/main.c,
@@ -41,6 +42,14 @@
 // included, has ended.  /CTSB, the HID doorbell, follows the core's input
 // queue.  CMD_RESET answers nothing and resets the machine.
 //
+// USB keyboard (the `keyboard` subdevice, zephyr80_usb_keyboard): its boot
+// reports reach the HID module (zephyr80_ioc_hid) only in the controller's
+// idle pass, as hid_host_task runs only between services: a report that
+// arrives during a service waits for its end.  The HID module's millisecond
+// clock is the firmware's 10 ms timebase, counted from the controller's
+// reset; a held key's repeat runs at the first idle pass on or after its due
+// tick.  Ctrl+Alt+Esc drops READY and resets the machine (handler_reset).
+//
 // Timing is a short table of named delays (zephyr80_ioc.cpp); command
 // processing itself takes no emulated time.
 //
@@ -57,7 +66,8 @@
 //
 // All state is save-registered and the scheduler saves the timer, so a state
 // saved mid-transfer resumes it.  A reset cancels the timer and every phase.
-class zephyr80_ioc_device : public device_t, public zephyr80_ioc_lane_client, private zephyr80_ioc_core::link
+class zephyr80_ioc_device : public device_t, public zephyr80_ioc_lane_client, private zephyr80_ioc_core::link,
+	private zephyr80_usb_keyboard_device::host
 {
 public:
 	zephyr80_ioc_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
@@ -73,6 +83,7 @@ public:
 	virtual void lane_data_event(zephyr80_ioc_lane lane) override;
 
 protected:
+	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
 
@@ -98,7 +109,13 @@ private:
 	virtual void hid_doorbell(bool asserted) override;
 	virtual void host_reset() override;
 
+	// zephyr80_usb_keyboard_device::host
+	virtual void keyboard_report(u8 const *report, unsigned length) override;
+
 	TIMER_CALLBACK_MEMBER(command_step);
+	TIMER_CALLBACK_MEMBER(hid_tick);
+	void hid_service();
+	u32 hid_now_ms() const;
 	void poll_request();
 	void serve();
 	void after_reply();
@@ -115,7 +132,9 @@ private:
 	zephyr80_ioc_speed_slot_device *m_speed;
 	bool m_fast;           // -ioc_speed fast
 	zephyr80_ioc_core m_core;
+	required_device<zephyr80_usb_keyboard_device> m_keyboard;
 	emu_timer *m_command_timer;
+	emu_timer *m_hid_timer;  // the repeat's due tick
 
 	u8 m_phase;
 	bool m_command_synced; // link_synced: /SYNCB is held low
@@ -131,6 +150,9 @@ private:
 	u16 m_bulk_count;      // bulk bytes clocked
 	u16 m_bulk_total;      // bulk bytes to clock
 	u8 m_bulk[zephyr80_ioc_core::BULK_WINDOW_MAX]; // the packet sent, or the window captured
+	attotime m_hid_epoch;  // the controller's reset: its millisecond clock's zero
+	u8 m_kbd_report[zephyr80_usb_keyboard_device::REPORT]; // a report waiting for the idle pass
+	bool m_kbd_pending;
 };
 
 DECLARE_DEVICE_TYPE(ZEPHYR80_IOC, zephyr80_ioc_device)
