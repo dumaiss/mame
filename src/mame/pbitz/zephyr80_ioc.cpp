@@ -7,30 +7,67 @@ DEFINE_DEVICE_TYPE(ZEPHYR80_IOC, zephyr80_ioc_device, "zephyr80_ioc", "Zephyr-80
 
 namespace {
 
-// The transport's delays.  The window, the guards, the bounded waits and the
-// reset hold are the firmware's constants (include/external_sync.h,
-// src/bulk_channel.c, src/handlers.c).  The byte periods are not all: the
-// command lane's EXTSYNC_TARGET_BYTE_US (16 us) is the firmware's target,
-// and the board's period is longer by the controller's per-byte overhead.
-// The KonaOS request loop (ioc_io_tx, 175 T-states a byte, one transmit
-// buffer of slack) works on the board, so its period is at least 17.5 us;
-// 20 us is this model's value until a board measurement replaces it.  The
-// bulk lane's send target is 6 us (BULK_TARGET_BYTE_US) and the KonaOS
-// read-path measurement records about 25 us a byte; this model sends at the
-// command lane's 20 us until a board measurement replaces it, and receives
-// at the firmware's BULK_RX_TARGET_BYTE_US.  The controller's own
-// processing takes no emulated time.
+// The transport's delays: a short table of named values from the controller
+// firmware's constants and the retained records, never from counting
+// instructions.  The guards, the bounded waits and the reset hold are the
+// firmware's constants (include/external_sync.h, src/bulk_channel.c,
+// src/handlers.c).  The command byte and the two bulk byte rows are not.
+//
+//  command byte       the firmware's target is EXTSYNC_TARGET_BYTE_US (16 us)
+//                     plus the controller's own per-byte overhead.  The
+//                     KonaOS request loop (ioc_tx_body, 175 T-states a byte,
+//                     one transmit buffer of slack) works on the board, so the
+//                     board period is at least 17.5 us; 16 us underran it
+//                     here.  No record gives the board value: 20 us stays
+//                     provisional until it is measured.
+//  bulk fixed byte    the marker, header and CRC trailer go through
+//                     bulk_send_packet_byte (firmware target about 7 us: 4 us
+//                     of SPI clocking, a 2 us gap and the call; the KonaOS
+//                     simulator's BULK_FIXED_BYTE_TSTATES is 70 at 10 MHz).
+//                     The establishing byte of an unsynchronised lane is
+//                     given the same time.  Lower bound inferred from ZSDOS
+//                     working on the board: its marker scan calls a one-byte
+//                     helper (111 T-states = 11.1 us a byte), so a wire byte
+//                     faster than that builds a backlog the 3-deep FIFO plus
+//                     pipeline cannot hold behind the 17 us of setup before
+//                     its payload loop.  11.1 us plus 6 us (the firmware's payload
+//                     period) of margin, rounded up: 18 us.  Calibrate with the board
+//                     measurement of the bulk packet's byte spacing.
+//  bulk payload byte  the firmware target BULK_TARGET_BYTE_US is 6 us (4 us of
+//                     SPI clocking plus BULK_PAYLOAD_GAP_US and the loop).
+//                     The same ZSDOS reader reads its first payload byte
+//                     21.2-26.3 us after it arrives (INI poll phase 4.0-9.1 us,
+//                     then 17.2 us of setup) against a cover of four payload
+//                     periods, so the board's period is at least 6.6 us.
+//                     With one period of cover as margin (4P - P >= 26.3):
+//                     9 us.  Inferred lower bound; calibrate likewise.
+//  bulk byte from Z80 BULK_RX_TARGET_BYTE_US, every byte of the window.
+//  backend latency    none: no record separates the card's access time from
+//                     the lane and the controller's request handling, so the
+//                     controller's processing and the card take no emulated
+//                     time.
 constexpr unsigned WINDOW_BYTES = 36;       // EXTSYNC_RX_WINDOW_BYTES
-constexpr u32 COMMAND_BYTE_US = 20;         // one command-lane byte
+constexpr u32 COMMAND_BYTE_US = 20;         // one command-lane byte (provisional)
 constexpr u32 REPLY_GUARD_US = 200;         // EXTSYNC_REPLY_GUARD_US
 // main.c bounds the wait for /RTSB to rise after the window by a loop count
 // (REQUEST_RELEASE_TIMEOUT_LOOPS); this model allows one millisecond.
 constexpr u32 RELEASE_WAIT_US = 1000;
-constexpr u32 BULK_SEND_BYTE_US = 20;       // one bulk byte to the Z80
+constexpr u32 BULK_FIXED_BYTE_US = 18;      // marker, header, CRC trailer, establishing byte (inferred lower bound)
+constexpr u32 BULK_PAYLOAD_BYTE_US = 9;     // payload byte (inferred lower bound)
 constexpr u32 BULK_RECEIVE_BYTE_US = 24;    // BULK_RX_TARGET_BYTE_US
 constexpr u32 BULK_ADMISSION_US = 100;      // BULK_ADMISSION_GUARD_US
 constexpr u32 BULK_HOST_WAIT_MS = 500;      // BULK_HOST_READY_TIMEOUT_MS
 constexpr u32 HOST_RESET_MS = 10;           // handler_reset's hold before the restart
+// A packet to the Z80: A5 5A LEN_LO LEN_HI TYPE SEQ STATUS, the payload, two
+// CRC bytes (zero under the deployed bypass), then the flush byte.
+constexpr unsigned BULK_HEADER_BYTES = 7;
+constexpr unsigned BULK_TRAILER_BYTES = 2;
+// Fast mode: the least a byte slot takes, so a polling guest always runs.
+constexpr u32 FAST_YIELD_US = 1;
+// Fast mode keeps the receiver's buffering full, so a character to the Z80
+// waits for room as long as a paced lane runs before its first overrun: the
+// FIFO (3), the pipeline (1) and the character being clocked.
+constexpr u32 FAST_ROOM_PERIODS = 5;
 
 constexpr zephyr80_ioc_lane COMMAND = zephyr80_ioc_lane::COMMAND;
 constexpr zephyr80_ioc_lane BULK = zephyr80_ioc_lane::BULK;
@@ -42,6 +79,8 @@ using bulk_dir = zephyr80_ioc_core::bulk_dir;
 zephyr80_ioc_device::zephyr80_ioc_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock)
 	: device_t(mconfig, ZEPHYR80_IOC, tag, owner, clock)
 	, m_lane(nullptr)
+	, m_speed(nullptr)
+	, m_fast(false)
 	, m_core(*this)
 	, m_command_timer(nullptr)
 {
@@ -53,12 +92,19 @@ void zephyr80_ioc_device::device_start()
 		throw emu_fatalerror("%s: no SIO1 lane attached", tag());
 	if (!m_core.has_storage())
 		throw emu_fatalerror("%s: no card socket attached", tag());
+	if (!m_speed)
+		throw emu_fatalerror("%s: no ioc_speed slot attached", tag());
+	m_fast = m_speed->fast();
 	m_command_timer = timer_alloc(FUNC(zephyr80_ioc_device::command_step), this);
 
 	m_core.save_state([this] (auto &&... item) { save_item(std::forward<decltype(item)>(item)...); });
 	save_item(NAME(m_phase));
 	save_item(NAME(m_command_synced));
 	save_item(NAME(m_bulk_synced));
+	save_item(NAME(m_waiting));
+	save_item(NAME(m_wait_lane));
+	save_item(NAME(m_wait_to_z80));
+	save_item(NAME(m_starved));
 	save_item(NAME(m_count));
 	save_item(NAME(m_reply_length));
 	save_item(NAME(m_window));
@@ -74,6 +120,10 @@ void zephyr80_ioc_device::device_reset()
 {
 	m_command_timer->adjust(attotime::never);
 	m_phase = IDLE;
+	m_waiting = false;
+	m_wait_lane = unsigned(COMMAND);
+	m_wait_to_z80 = false;
+	m_starved = false;
 	m_count = 0;
 	m_reply_length = 0;
 	m_bulk_count = 0;
@@ -138,6 +188,59 @@ void zephyr80_ioc_device::lane_rts_changed(zephyr80_ioc_lane lane, bool asserted
 	}
 }
 
+void zephyr80_ioc_device::lane_data_event(zephyr80_ioc_lane lane)
+{
+	if (m_waiting && unsigned(lane) == m_wait_lane)
+		wake();
+}
+
+// The period that follows byte `index` of a packet to the Z80.
+u32 zephyr80_ioc_device::bulk_send_period(unsigned index) const
+{
+	bool const payload = index >= BULK_HEADER_BYTES && index + BULK_TRAILER_BYTES < m_bulk_total;
+	return payload ? BULK_PAYLOAD_BYTE_US : BULK_FIXED_BYTE_US;
+}
+
+// The next byte slot of a transfer.  Paced: one period.  Fast: a yield when
+// the other end is ready now, else the period, shortened by wake() the moment
+// it becomes ready.
+void zephyr80_ioc_device::next_byte(u32 period_us, zephyr80_ioc_lane lane, bool to_z80)
+{
+	if (!m_fast)
+	{
+		m_command_timer->adjust(attotime::from_usec(period_us));
+		return;
+	}
+	m_waiting = true;
+	m_wait_lane = unsigned(lane);
+	m_wait_to_z80 = to_z80;
+	u32 const deadline = (to_z80 && !m_starved) ? FAST_ROOM_PERIODS * period_us : period_us;
+	m_command_timer->adjust(attotime::from_usec(byte_ready() ? FAST_YIELD_US : deadline));
+}
+
+bool zephyr80_ioc_device::byte_ready() const
+{
+	zephyr80_ioc_lane const lane = zephyr80_ioc_lane(m_wait_lane);
+	if (m_wait_to_z80)
+		return m_lane->lane_rx_room(lane);
+	if (m_lane->lane_tx_loaded(lane))
+		return true;
+	// A bulk write has no release, so a missed deadline ends the Z80's
+	// transmission and the rest of the window is fill.  A request window
+	// keeps its length: the guest arms its receiver in the time it leaves,
+	// and a late byte lands in its own slot as it does paced.
+	return lane == BULK && m_starved;
+}
+
+void zephyr80_ioc_device::wake()
+{
+	if (!m_fast || !m_waiting || !byte_ready())
+		return;
+	attotime const yield = attotime::from_usec(FAST_YIELD_US);
+	if (m_command_timer->remaining() > yield)
+		m_command_timer->adjust(yield);
+}
+
 // A request is the /RTSB level, taken only while idle.
 void zephyr80_ioc_device::poll_request()
 {
@@ -147,7 +250,8 @@ void zephyr80_ioc_device::poll_request()
 	m_core.begin();
 	m_phase = WINDOW;
 	m_count = 0;
-	m_command_timer->adjust(attotime::from_usec(COMMAND_BYTE_US));
+	m_starved = false;
+	next_byte(COMMAND_BYTE_US, COMMAND, false);
 }
 
 void zephyr80_ioc_device::serve()
@@ -163,6 +267,7 @@ void zephyr80_ioc_device::serve()
 		return; // CMD_RESET: host_reset() took over
 	m_reply_length = zephyr80_ioc_core::encode(reply, m_reply);
 	m_count = 0;
+	m_starved = false;
 	m_phase = GUARD;
 	m_command_timer->adjust(attotime::from_usec(REPLY_GUARD_US));
 }
@@ -204,6 +309,7 @@ void zephyr80_ioc_device::bulk_admit()
 	}
 	m_lane->lane_cts(BULK, true);
 	m_bulk_count = 0;
+	m_starved = false;
 	m_phase = BULK_GUARD;
 	m_command_timer->adjust(attotime::from_usec(BULK_ADMISSION_US));
 }
@@ -241,13 +347,19 @@ void zephyr80_ioc_device::bulk_step()
 
 TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::command_step)
 {
+	// Fast: a slot that reaches its deadline with the other end not ready
+	// means that end has stopped; the rest of the transfer runs at the paced
+	// periods (to the Z80) or is fill (from the Z80).
+	if (m_waiting && !byte_ready())
+		m_starved = true;
+	m_waiting = false;
 	switch (m_phase)
 	{
 	case WINDOW:
 		m_window[m_count++] = m_lane->lane_clock(COMMAND, 0xff);
 		if (m_count < WINDOW_BYTES)
 		{
-			m_command_timer->adjust(attotime::from_usec(COMMAND_BYTE_US));
+			next_byte(COMMAND_BYTE_US, COMMAND, false);
 		}
 		else if (!m_lane->lane_rts(COMMAND))
 		{
@@ -274,7 +386,7 @@ TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::command_step)
 			m_lane->lane_clock(COMMAND, 0xff);
 			m_lane->lane_sync(COMMAND, true);
 			m_command_synced = true;
-			m_command_timer->adjust(attotime::from_usec(COMMAND_BYTE_US));
+			next_byte(COMMAND_BYTE_US, COMMAND, true);
 			break;
 		}
 		[[fallthrough]];
@@ -283,7 +395,7 @@ TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::command_step)
 		if (m_count < m_reply_length)
 		{
 			m_lane->lane_clock(COMMAND, m_reply[m_count++]);
-			m_command_timer->adjust(attotime::from_usec(COMMAND_BYTE_US));
+			next_byte(COMMAND_BYTE_US, COMMAND, true);
 		}
 		else
 		{
@@ -311,7 +423,7 @@ TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::command_step)
 				m_lane->lane_clock(BULK, 0xff);
 				m_lane->lane_sync(BULK, true);
 				m_bulk_synced = true;
-				m_command_timer->adjust(attotime::from_usec(BULK_SEND_BYTE_US));
+				next_byte(BULK_FIXED_BYTE_US, BULK, true);
 				break;
 			}
 		}
@@ -327,13 +439,14 @@ TIMER_CALLBACK_MEMBER(zephyr80_ioc_device::command_step)
 		{
 			if (m_phase == BULK_SEND)
 			{
+				u32 const period = bulk_send_period(m_bulk_count);
 				m_lane->lane_clock(BULK, m_bulk[m_bulk_count++]);
-				m_command_timer->adjust(attotime::from_usec(BULK_SEND_BYTE_US));
+				next_byte(period, BULK, true);
 			}
 			else
 			{
 				m_bulk[m_bulk_count++] = m_lane->lane_clock(BULK, 0xff);
-				m_command_timer->adjust(attotime::from_usec(BULK_RECEIVE_BYTE_US));
+				next_byte(BULK_RECEIVE_BYTE_US, BULK, false);
 			}
 			break;
 		}

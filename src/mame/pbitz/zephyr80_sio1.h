@@ -50,6 +50,8 @@ public:
 	virtual void lane_dcd(zephyr80_ioc_lane lane, bool asserted) override;
 	virtual void lane_cts(zephyr80_ioc_lane lane, bool asserted) override;
 	virtual bool lane_rts(zephyr80_ioc_lane lane) const override;
+	virtual bool lane_rx_room(zephyr80_ioc_lane lane) const override;
+	virtual bool lane_tx_loaded(zephyr80_ioc_lane lane) const override;
 
 protected:
 	virtual void device_start() override ATTR_COLD;

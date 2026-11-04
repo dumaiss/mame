@@ -154,6 +154,8 @@ void zephyr80_sio1_device::ba_cd_w(offs_t offset, u8 data)
 		// A write over a full buffer replaces the waiting character.
 		m_tx_buffer[ch] = data;
 		m_tx_full[ch] = true;
+		if (m_client)
+			m_client->lane_data_event(lane_of(ch));
 	}
 }
 
@@ -191,6 +193,8 @@ u8 zephyr80_sio1_device::data_read(unsigned ch)
 	{
 		return m_fifo[ch][0];
 	}
+	if (m_client && !machine().side_effects_disabled())
+		m_client->lane_data_event(lane_of(ch));
 	return m_data[ch];
 }
 
@@ -400,4 +404,21 @@ void zephyr80_sio1_device::lane_cts(zephyr80_ioc_lane lane, bool asserted)
 bool zephyr80_sio1_device::lane_rts(zephyr80_ioc_lane lane) const
 {
 	return m_rts[channel_of(lane)];
+}
+
+// A character clocked now enters the FIFO or waits in the pipeline unless the
+// FIFO is full and the pipeline holds one already; a receiver that is off or
+// hunting drops what it is given.
+bool zephyr80_sio1_device::lane_rx_room(zephyr80_ioc_lane lane) const
+{
+	unsigned const ch = channel_of(lane);
+	if (!(m_wr[ch][3] & WR3_RX_ENABLE) || m_hunt[ch])
+		return true;
+	return m_fifo_depth[ch] < 3 || !m_pipe_full[ch];
+}
+
+bool zephyr80_sio1_device::lane_tx_loaded(zephyr80_ioc_lane lane) const
+{
+	unsigned const ch = channel_of(lane);
+	return (m_wr[ch][5] & WR5_TX_ENABLE) && (m_tx_full[ch] || m_crc_left[ch]);
 }

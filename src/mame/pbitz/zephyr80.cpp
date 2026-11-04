@@ -8,6 +8,7 @@
 #include "zephyr80_card_slot.h"
 #include "zephyr80_flash.h"
 #include "zephyr80_ioc.h"
+#include "zephyr80_ioc_speed.h"
 #include "zephyr80_sio1.h"
 
 #include "bus/rs232/loopback.h"
@@ -29,6 +30,13 @@ void pbitz_rs232_devices(device_slot_interface &device)
 {
 	device.option_add("pty", PSEUDO_TERMINAL);
 	device.option_add("loopback", RS232_LOOPBACK);
+}
+
+// -ioc_speed: how the IO controller's lanes keep time.
+void pbitz_ioc_speed_devices(device_slot_interface &device)
+{
+	device.option_add("paced", ZEPHYR80_IOC_PACED);
+	device.option_add("fast", ZEPHYR80_IOC_FAST);
 }
 
 // The SIO0/B console link runs at a fixed 115200 8N1 (1.8432 MHz x16), so default
@@ -323,6 +331,7 @@ void zephyr80_state::zephyr80(machine_config &config)
 	ZEPHYR80_IOC(config, m_ioc);
 	m_sio1->set_client(*m_ioc);
 	m_ioc->set_lane(*m_sio1);
+	m_ioc->set_speed(ZEPHYR80_IOC_SPEED(config, "ioc_speed", pbitz_ioc_speed_devices, "paced"));
 	m_ioc->set_storage(m_card);
 	ZEPHYR80_CARD_IMAGE(config, "card").set_socket(m_card);
 	ZEPHYR80_CARD_FOLDER(config, "carddir").set_socket(m_card);

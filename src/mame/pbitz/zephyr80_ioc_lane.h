@@ -29,6 +29,12 @@ public:
 	// The SIO's /RTS output, as an asserted (low) level.
 	virtual bool lane_rts(zephyr80_ioc_lane lane) const = 0;
 
+	// Whether the other end can take a character now: a character clocked to
+	// the Z80 would not overwrite one it has not read, and the Z80's
+	// transmitter holds a character the next clock would carry.
+	virtual bool lane_rx_room(zephyr80_ioc_lane lane) const = 0;
+	virtual bool lane_tx_loaded(zephyr80_ioc_lane lane) const = 0;
+
 protected:
 	~zephyr80_ioc_lane_port() = default;
 };
@@ -38,6 +44,8 @@ class zephyr80_ioc_lane_client
 {
 public:
 	virtual void lane_rts_changed(zephyr80_ioc_lane lane, bool asserted) = 0;
+	// The Z80 read or wrote the lane's data port.
+	virtual void lane_data_event(zephyr80_ioc_lane lane) = 0;
 
 protected:
 	~zephyr80_ioc_lane_client() = default;
