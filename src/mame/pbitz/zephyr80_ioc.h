@@ -9,10 +9,11 @@
 #include "zephyr80_ioc_lane.h"
 
 // The IO controller as the Z80 sees it through SIO1: a behavioural model of
-// the firmware's command transport (Code/MCU/IOController src/main.c and
-// src/external_sync.c) driving the lanes, with the protocol in
-// zephyr80_ioc_core.  Not a PIC18: no firmware runs, and nothing below the
-// lane pins (the PIC, SPI2, the clock gates, USB, the card) is modelled.
+// the firmware's transport (Code/MCU/IOController src/main.c,
+// src/external_sync.c, src/bulk_channel.c) driving the lanes, with the
+// protocol in zephyr80_ioc_core.  Not a PIC18: no firmware runs, and nothing
+// below the lane pins (the PIC, SPI2, the clock gates, USB, the card) is
+// modelled.
 //
 // Command lane (SIO1/B), one service per request:
 //   COMMAND_READY (/DCDB) is asserted while idle.  A request is /RTSB held
@@ -24,11 +25,20 @@
 //   disposable establishing byte and the falling /SYNCB edge while the lane
 //   is not yet synchronised, then one trailing FFh that pushes the last
 //   reply byte out of the SIO's receive pipeline.  /SYNCB then stays low
-//   until LINK_SYNC releases it.  READY returns when the service ends.  A
-//   window with no valid request, or a request not released in time, gets
-//   no reply.
-// HID doorbell (/CTSB) and bulk admission (/DCDA, /CTSA) stay deasserted:
-// no HID queue or bulk transfer exists in this model yet.
+//   until LINK_SYNC releases it.  A window with no valid request, or a
+//   request not released in time, gets no reply.
+// Bulk lane (SIO1/A), after a reply that armed a transfer (READY):
+//   the controller waits for the host's /RTSA, asserts /CTSA (and /DCDA for
+//   a transfer to the Z80), waits the admission guard, then clocks the
+//   transfer: to the Z80 the establishing byte and falling /SYNCA edge while
+//   that lane is not synchronised, the packet and one flush byte; from the
+//   Z80 the capture window, whose packet the core then checks and commits.
+//   /CTSA and /DCDA close after the bytes; a FS2_READ_RUN's further packets
+//   each wait for /RTSA to be released and asserted again.  A host that
+//   never asserts /RTSA fails the transfer (BULK_NO_HOST).
+// READY returns only when the whole service, bulk phase and backend effect
+// included, has ended.  /CTSB, the HID doorbell, follows the core's input
+// queue.  CMD_RESET answers nothing and resets the machine.
 //
 // Timing is a short table of named delays (zephyr80_ioc.cpp); command
 // processing itself takes no emulated time.
@@ -38,6 +48,8 @@ public:
 	zephyr80_ioc_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
 
 	void set_lane(zephyr80_ioc_lane_port &lane) { m_lane = &lane; }
+	// The media in the card socket; none means an empty socket.
+	void set_storage(zephyr80_ioc_storage *media) { m_core.set_storage(media); }
 
 	// zephyr80_ioc_lane_client
 	virtual void lane_rts_changed(zephyr80_ioc_lane lane, bool asserted) override;
@@ -49,20 +61,31 @@ protected:
 private:
 	enum : u8
 	{
-		IDLE,     // READY asserted, waiting for a request
-		WINDOW,   // clocking the request window
-		RELEASE,  // window done, waiting for /RTSB to rise
-		GUARD,    // reply turnaround guard
-		REPLY     // clocking the reply
+		IDLE,         // READY asserted, waiting for a request
+		WINDOW,       // clocking the request window
+		RELEASE,      // window done, waiting for /RTSB to rise
+		GUARD,        // reply turnaround guard
+		REPLY,        // clocking the reply
+		BULK_HOST,    // waiting for the host's /RTSA
+		BULK_GUARD,   // admission asserted, guard before the clock
+		BULK_SEND,    // clocking a packet to the Z80
+		BULK_RECEIVE, // clocking the capture window from the Z80
+		BULK_RELEASE, // between a run's packets: waiting for /RTSA to rise
+		RESETTING     // CMD_RESET: the host reset follows
 	};
 
 	// zephyr80_ioc_core::link
 	virtual void resync_lanes() override;
 	virtual bool command_lane_synced() const override { return m_command_synced; }
+	virtual void hid_doorbell(bool asserted) override;
+	virtual void host_reset() override;
 
 	TIMER_CALLBACK_MEMBER(command_step);
 	void poll_request();
 	void serve();
+	void after_reply();
+	void bulk_admit();
+	void bulk_step();
 	void end_service();
 	void set_ready(bool ready);
 
@@ -72,11 +95,14 @@ private:
 
 	u8 m_phase;
 	bool m_command_synced; // link_synced: /SYNCB is held low
-	bool m_bulk_synced;    // the bulk lane's /SYNCA likewise
+	bool m_bulk_synced;    // bulk_synced: /SYNCA is held low
 	u8 m_count;            // window bytes clocked / reply bytes sent
 	u8 m_reply_length;
 	u8 m_window[36];
 	u8 m_reply[zephyr80_ioc_core::MAX_WIRE];
+	u16 m_bulk_count;      // bulk bytes clocked
+	u16 m_bulk_total;      // bulk bytes to clock
+	u8 m_bulk[zephyr80_ioc_core::BULK_WINDOW_MAX]; // the packet sent, or the window captured
 };
 
 DECLARE_DEVICE_TYPE(ZEPHYR80_IOC, zephyr80_ioc_device)
