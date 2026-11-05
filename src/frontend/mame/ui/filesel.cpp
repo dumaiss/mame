@@ -71,6 +71,7 @@ menu_file_selector::menu_file_selector(
 	, m_has_softlist(has_softlist)
 	, m_has_create(has_create)
 	, m_is_midi((image.device().type() == MIDIIN) || (image.device().type() == MIDIOUT))
+	, m_is_folder(image.is_directory_media())
 	, m_clicked_directory(std::string::npos, std::string::npos)
 {
 	set_process_flags(PROCESS_IGNOREPAUSE);
@@ -322,6 +323,10 @@ void menu_file_selector::append_entry_menu_item(const file_selector_entry *entry
 			text = _("[MIDI port]");
 			break;
 
+		case SELECTOR_ENTRY_TYPE_FOLDER:
+			text = _("[use this folder]");
+			break;
+
 		case SELECTOR_ENTRY_TYPE_CREATE:
 			text = _("[create]");
 			break;
@@ -363,6 +368,12 @@ void menu_file_selector::select_item(const file_selector_entry &entry)
 
 	case SELECTOR_ENTRY_TYPE_MIDI:
 		m_handler(result::MIDI, m_current_directory, m_current_file);
+		break;
+
+	case SELECTOR_ENTRY_TYPE_FOLDER:
+		// directory media: the current directory itself is the image
+		m_current_file = m_current_directory;
+		m_handler(result::FILE, m_current_directory, m_current_file);
 		break;
 
 	case SELECTOR_ENTRY_TYPE_CREATE:
@@ -495,6 +506,10 @@ void menu_file_selector::populate()
 	// add the "[midi port]" entry if available
 	if (m_is_midi)
 		append_entry(SELECTOR_ENTRY_TYPE_MIDI, "", "");
+
+	// add the "[use this folder]" entry for directory media
+	if (m_is_folder && directory && !directory->is_archive())
+		append_entry(SELECTOR_ENTRY_TYPE_FOLDER, "", "");
 
 	// add the "[create]" entry
 	if (m_has_create && directory && !directory->is_archive())

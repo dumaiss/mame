@@ -54,6 +54,7 @@ public:
 	zephyr80_card_folder_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
 
 	virtual const char *file_extensions() const noexcept override { return ""; }
+	virtual bool is_directory_media() const noexcept override { return true; }
 	virtual const char *image_type_name() const noexcept override { return "carddir"; }
 	virtual const char *image_brief_type_name() const noexcept override { return "carddir"; }
 

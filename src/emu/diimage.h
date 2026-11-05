@@ -90,6 +90,7 @@ public:
 	virtual std::string call_display() { return std::string(); }
 	virtual u32 unhashed_header_length() const noexcept { return 0; }
 	virtual bool core_opens_image_file() const noexcept { return true; }
+	virtual bool is_directory_media() const noexcept { return false; } // media is a host directory, chosen as a whole
 	virtual bool image_is_chd_type() const noexcept { return false; }
 	virtual bool is_readable()  const noexcept = 0;
 	virtual bool is_writeable() const noexcept = 0;

@@ -66,6 +66,7 @@ private:
 	{
 		SELECTOR_ENTRY_TYPE_EMPTY,
 		SELECTOR_ENTRY_TYPE_MIDI,
+		SELECTOR_ENTRY_TYPE_FOLDER,
 		SELECTOR_ENTRY_TYPE_CREATE,
 		SELECTOR_ENTRY_TYPE_SOFTWARE_LIST,
 		SELECTOR_ENTRY_TYPE_DRIVE,
@@ -94,6 +95,7 @@ private:
 	bool const                          m_has_softlist;
 	bool const                          m_has_create;
 	bool const                          m_is_midi;
+	bool const                          m_is_folder;
 	std::vector<file_selector_entry>    m_entrylist;
 	std::string                         m_filename;
 	std::pair<size_t, size_t>           m_clicked_directory;
