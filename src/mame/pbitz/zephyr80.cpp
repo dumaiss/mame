@@ -126,7 +126,7 @@ private:
 	void ctc_w(offs_t offset, u8 data);
 	u8 vdp_r(offs_t offset);
 	void vdp_w(offs_t offset, u8 data);
-	u8 ctrl_r();
+	u8 ctrl_r(offs_t offset);
 	void sound_w(offs_t offset, u8 data);
 	void psg_ready_w(int state);
 
@@ -244,7 +244,7 @@ void zephyr80_state::io_map(address_map &map)
 	// IO_DECODER.pld: $e0-$ff is SOUND on write and CTRL on read.  The Afternoon
 	// Blend card decodes only A2:A0 (74AHCT138 U8), so its eight ports repeat
 	// four times across the block (see sound_w).  Reads are the controller
-	// latches: all ones until they exist, and no sound device sees a read.
+	// latches (see ctrl_r), and no sound device sees a read.
 	map(io::SOUND_CTRL_START, io::SOUND_CTRL_END).rw(FUNC(zephyr80_state::ctrl_r), FUNC(zephyr80_state::sound_w));
 
 	// Reserved by IO_DECODER.pld for future phases:
@@ -325,9 +325,15 @@ void zephyr80_state::vdp_w(offs_t offset, u8 data)
 	}
 }
 
-u8 zephyr80_state::ctrl_r()
+// IO_DECODER.pld: a read of E0h-FFh is CTRL.  The IO board's U6 (74HC138)
+// selects one of the two controller latches by bus A0 alone (see
+// zephyr80_map::io::controller_port); the 74AHC595 outputs drive the data bus
+// as the IO controller loaded them.  A pad that is absent or idle reads 7Fh.
+// The ColecoVision mode-select writes (80h-9Fh, C0h-DFh) decode to nothing on
+// this board; there is no mode to switch.
+u8 zephyr80_state::ctrl_r(offs_t offset)
 {
-	return 0xff;
+	return m_ioc->controller(zephyr80_map::io::controller_port(u8(offset)));
 }
 
 // Afternoon Blend (Sound.kicad_sch).  U8 (74AHCT138) decodes A2:A0 with /WR on

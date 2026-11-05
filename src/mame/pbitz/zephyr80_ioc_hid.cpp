@@ -82,6 +82,12 @@ zephyr80_ioc_hid::zephyr80_ioc_hid(doorbell &line)
 	, m_caps_lock(false), m_num_lock(true), m_leds(0)
 	, m_repeat_key(0), m_repeat_mod(0), m_repeat_due(0)
 	, m_reset_combo(false)
+	, m_device_count(0), m_mount_count(0), m_unmount_count(0), m_last_addr(0xff)
+	, m_last_vid(0xffff), m_last_pid(0xffff), m_hid_mounts(0), m_last_hid_addr(0xff), m_last_hid_proto(0xff)
+	, m_pad_addr{}, m_pad_first_arm{ 0xff, 0xff }, m_pad_reports{}, m_pad_last_len{}, m_pad_next_poll{}
+	, m_other_addr(0), m_other_reports(0), m_other_last_len(0), m_other_last{}
+	, m_mouse_x(0), m_mouse_y(0), m_mouse_wheel(0), m_mouse_buttons(0), m_mouse_decoded(false)
+	, m_pend_x(0), m_pend_y(0), m_pend_wheel(0), m_mouse_pressed(0)
 {
 }
 
@@ -100,7 +106,56 @@ void zephyr80_ioc_hid::reset()
 	m_repeat_mod = 0;
 	m_repeat_due = 0;
 	m_reset_combo = false;
+	m_device_count = m_mount_count = m_unmount_count = 0;
+	m_last_addr = 0xff;
+	m_last_vid = m_last_pid = 0xffff;
+	m_hid_mounts = 0;
+	m_last_hid_addr = m_last_hid_proto = 0xff;
+	m_pad_addr.fill(0);
+	m_pad_first_arm.fill(0xff);
+	m_pad_reports.fill(0);
+	m_pad_last_len.fill(0);
+	m_pad_next_poll.fill(0);
+	m_latch.reset();
+	m_other_addr = 0;
+	m_other_reports = 0;
+	m_other_last_len = 0;
+	m_other_last.fill(0);
+	m_mouse_x = m_mouse_y = m_mouse_wheel = 0;
+	m_mouse_buttons = 0;
+	m_mouse_decoded = false;
+	m_pend_x = m_pend_y = m_pend_wheel = 0;
+	m_mouse_pressed = 0;
 	m_doorbell.hid_doorbell(false);
+}
+
+// tuh_mount_cb and tuh_umount_cb: the device counters of HID_STATUS page 6.
+void zephyr80_ioc_hid::usb_mounted(u8 address, u16 vid, u16 pid)
+{
+	if (m_device_count != 0xff)
+		m_device_count++;
+	if (m_mount_count != 0xff)
+		m_mount_count++;
+	m_last_addr = address;
+	m_last_vid = vid;
+	m_last_pid = pid;
+}
+
+void zephyr80_ioc_hid::usb_unmounted()
+{
+	if (m_device_count != 0)
+		m_device_count--;
+	if (m_unmount_count != 0xff)
+		m_unmount_count++;
+}
+
+// tuh_hid_mount_cb's record of what it was handed, before any filtering.
+void zephyr80_ioc_hid::hid_mounted(u8 address, u8 protocol)
+{
+	if (m_hid_mounts != 0xff)
+		m_hid_mounts++;
+	m_last_hid_addr = address;
+	m_last_hid_proto = protocol;
 }
 
 // tuh_hid_mount_cb's keyboard branch: a fresh keyboard has its LEDs dark,
@@ -115,10 +170,14 @@ void zephyr80_ioc_hid::mount()
 	m_leds = LED_NUM_LOCK;
 	m_last.fill(0);
 	m_speed = SPEED_FULL;
+	usb_mounted(KEYBOARD_ADDRESS, 0xffff, 0xffff);
+	hid_mounted(KEYBOARD_ADDRESS, 1);
 }
 
 void zephyr80_ioc_hid::unmount()
 {
+	if (m_keyboard_addr != 0)
+		usb_unmounted();
 	m_keyboard_addr = 0;
 	m_reports = 0;
 	m_speed = 0xff;
@@ -317,6 +376,10 @@ void zephyr80_ioc_hid::report(u8 const *report, unsigned length, u32 now_ms)
 		}
 	}
 
+	// The number keys onto port 0's keypad lines, on every report (an empty one
+	// releases), without consuming the key: the digits still reach the queue.
+	m_latch.keypad(0, keypad_for_report(report, copy));
+
 	u8 pressed = 0;
 	for (unsigned i = 2; i < copy; i++)
 	{
@@ -369,4 +432,255 @@ bool zephyr80_ioc_hid::repeat_due(u32 &due_ms) const
 		return false;
 	due_ms = m_repeat_due;
 	return true;
+}
+
+// coleco_keypad_nibble: the ColecoVision BIOS decode table at 10F5h,
+// complemented; order 0-9, then * and #.
+namespace {
+constexpr u8 KEYPAD_NIBBLE[12] = { 0x0a, 0x0d, 0x07, 0x0c, 0x02, 0x03, 0x0e, 0x05, 0x01, 0x0b, 0x09, 0x06 };
+constexpr u8 KEY_1 = 0x1e, KEY_3 = 0x20, KEY_8 = 0x25, KEY_0 = 0x27;
+}
+
+// coleco_keypad_for_report: the keypad code a boot report holds.  The number
+// row and the keypad give 0-9; keypad * and Shift+8 are *, Shift+3 is #;
+// other shifted keys give nothing.  The first matching slot wins.
+u8 zephyr80_ioc_hid::keypad_for_report(u8 const *report, unsigned length)
+{
+	if (length < 3)
+		return zephyr80_controller_latch::KEYPAD_NONE;
+	bool const shifted = (report[0] & MOD_SHIFT) != 0;
+	for (unsigned index = 2; index < length; index++)
+	{
+		u8 const usage = report[index];
+		if (usage == KEY_KEYPAD_MULTIPLY)
+			return KEYPAD_NIBBLE[10];
+		if (shifted && usage == KEY_8)
+			return KEYPAD_NIBBLE[10];
+		if (shifted && usage == KEY_3)
+			return KEYPAD_NIBBLE[11];
+		if (shifted)
+			continue;
+		if (usage >= KEY_1 && usage <= KEY_1 + 8)
+			return KEYPAD_NIBBLE[usage - KEY_1 + 1];
+		if (usage == KEY_0)
+			return KEYPAD_NIBBLE[0];
+		if (usage >= KEY_KEYPAD_1 && usage <= KEY_KEYPAD_1 + 8)
+			return KEYPAD_NIBBLE[usage - KEY_KEYPAD_1 + 1];
+		if (usage == KEY_KEYPAD_0)
+			return KEYPAD_NIBBLE[0];
+	}
+	return zephyr80_controller_latch::KEYPAD_NONE;
+}
+
+// tuh_hid_mount_cb for an interface that is not the keyboard and not an
+// F310.  A boot mouse (protocol 2) returns before anything is armed; with no
+// keyboard yet the interface would become the keyboard, which is not modelled.
+bool zephyr80_ioc_hid::mount_mouse(u8 protocol)
+{
+	hid_mounted(KEYBOARD_ADDRESS, protocol);
+	if (protocol == 2 || m_keyboard_addr == 0)
+		return false;
+	m_other_addr = m_keyboard_addr;
+	m_other_reports = 0;
+	m_other_last_len = 0;
+	return true;
+}
+
+// tuh_hid_umount_cb for that interface.
+void zephyr80_ioc_hid::unmount_mouse()
+{
+	if (m_other_addr == 0)
+		return;
+	m_other_addr = 0;
+	m_mouse_buttons = 0;
+	m_mouse_decoded = false;
+	m_pend_x = m_pend_y = m_pend_wheel = 0;
+	m_mouse_pressed = 0;
+}
+
+namespace {
+
+// The capped add of tuh_hid_report_received_cb: a slow reader sees a long
+// throw clipped, never reversed.
+s16 capped_add(s16 pending, s16 delta)
+{
+	s32 sum = s32(pending) + s32(delta);
+	if (sum > 32767)
+		sum = 32767;
+	if (sum < -32767)
+		sum = -32767;
+	return s16(sum);
+}
+
+} // anonymous namespace
+
+// tuh_hid_report_received_cb, the other-interface branch: the report is
+// counted and kept raw; a 7-byte report with ID 02 is the dongle's mouse.
+void zephyr80_ioc_hid::mouse_report(u8 const *report, unsigned length)
+{
+	if (m_other_addr == 0)
+		return;
+	unsigned const copy = length < REPORT ? length : REPORT;
+	if (m_other_reports != 0xffff)
+		m_other_reports++;
+	m_other_last_len = length > 0xff ? 0xff : u8(length);
+	for (unsigned i = 0; i < REPORT; i++)
+		m_other_last[i] = i < copy ? report[i] : 0;
+
+	if (length != MOUSE_REPORT_LEN || report[0] != MOUSE_REPORT_ID)
+		return;
+	u16 dx = u16(report[2]) | (u16(report[3] & 0x0f) << 8);
+	if (dx & 0x0800)
+		dx |= 0xf000;
+	u16 dy = u16(report[3] >> 4) | (u16(report[4]) << 4);
+	if (dy & 0x0800)
+		dy |= 0xf000;
+	m_mouse_pressed |= u8(report[1] & u8(~m_mouse_buttons));
+	m_mouse_buttons = report[1];
+	m_mouse_decoded = true;
+	m_mouse_x += dx;
+	m_mouse_y += dy;
+	m_mouse_wheel += (report[5] & 0x80) ? u16(0xff00 | report[5]) : u16(report[5]);
+	m_pend_x = capped_add(m_pend_x, s16(dx));
+	m_pend_y = capped_add(m_pend_y, s16(dy));
+	m_pend_wheel = capped_add(m_pend_wheel, s16(s8(report[5])));
+}
+
+// hid_mouse_take: flags, the buttons held, the buttons pressed since the last
+// take, and the motion since it; the take clears the last two and the motion.
+zephyr80_ioc_hid::mouse_read zephyr80_ioc_hid::mouse_take()
+{
+	mouse_read out;
+	out.flags = u8((m_other_addr != 0 ? HID_MOUSE_MOUNTED : 0) | (m_mouse_decoded ? HID_MOUSE_DECODED : 0));
+	out.buttons = m_mouse_buttons;
+	out.pressed = m_mouse_pressed;
+	out.dx = m_pend_x;
+	out.dy = m_pend_y;
+	out.wheel = m_pend_wheel;
+	m_mouse_pressed = 0;
+	m_pend_x = m_pend_y = m_pend_wheel = 0;
+	return out;
+}
+
+// tuh_mount_cb and the F310 branch of tuh_hid_mount_cb: the first free slot,
+// polled at once; a device address from 2 (the keyboard dongle is 1).
+u8 zephyr80_ioc_hid::mount_pad(u8 &address)
+{
+	address = 0;
+	u8 candidate = 2;
+	while (candidate < 4 && (m_pad_addr[0] == candidate || m_pad_addr[1] == candidate))
+		candidate++;
+	usb_mounted(candidate, F310_VID, F310_PID);
+	hid_mounted(candidate, 0);
+	for (unsigned slot = 0; slot < GAMEPADS; slot++)
+	{
+		if (m_pad_addr[slot] == 0)
+		{
+			m_pad_addr[slot] = candidate;
+			m_pad_next_poll[slot] = 0;
+			m_pad_first_arm[slot] = 1;
+			m_pad_reports[slot] = 0;
+			m_pad_last_len[slot] = 0;
+			address = candidate;
+			return u8(slot);
+		}
+	}
+	return GAMEPAD_NONE;
+}
+
+// gamepad_unmount: the slot is freed and its latch returns to idle (a held
+// keypad key stays held).
+void zephyr80_ioc_hid::pad_release(u8 slot)
+{
+	m_pad_addr[slot] = 0;
+	m_pad_next_poll[slot] = 0;
+	m_pad_first_arm[slot] = 0xff;
+	m_latch.release(slot);
+}
+
+void zephyr80_ioc_hid::unmount_pad(u8 slot)
+{
+	if (slot >= GAMEPADS || m_pad_addr[slot] == 0)
+		return;
+	pad_release(slot);
+	usb_unmounted();
+}
+
+bool zephyr80_ioc_hid::gamepad_due(unsigned slot, u32 now_ms) const
+{
+	return slot < GAMEPADS && m_pad_addr[slot] != 0 && s32(now_ms - m_pad_next_poll[slot]) >= 0;
+}
+
+// The F310 branch of tuh_hid_report_received_cb: counted, decoded into the
+// latch, and the next poll GAMEPAD_POLL_MS after it.
+void zephyr80_ioc_hid::gamepad_report(unsigned slot, u8 const *report, unsigned length, u32 now_ms)
+{
+	if (slot >= GAMEPADS || m_pad_addr[slot] == 0)
+		return;
+	if (m_pad_reports[slot] != 0xffff)
+		m_pad_reports[slot]++;
+	m_pad_last_len[slot] = length > 0xff ? 0xff : u8(length);
+	m_latch.f310_report(slot, report, length);
+	m_pad_next_poll[slot] = now_ms + GAMEPAD_POLL_MS;
+}
+
+bool zephyr80_ioc_hid::gamepad_next_due(u32 &due_ms) const
+{
+	bool found = false;
+	for (unsigned slot = 0; slot < GAMEPADS; slot++)
+	{
+		if (m_pad_addr[slot] != 0 && (!found || s32(m_pad_next_poll[slot] - due_ms) < 0))
+		{
+			due_ms = m_pad_next_poll[slot];
+			found = true;
+		}
+	}
+	return found;
+}
+
+// hid_host_gamepad_state.  The live-device fields count the non-hub
+// addresses the stack has (1 and 2); the keyboard dongle is address 1.
+void zephyr80_ioc_hid::state(gamepad_state &out) const
+{
+	out = gamepad_state{};
+	out.last_device_addr = 0xff;
+	out.last_device_vid = out.last_device_pid = 0xffff;
+	for (u8 address = 1; address <= 2; address++)
+	{
+		bool live = address == m_keyboard_addr;
+		for (unsigned slot = 0; slot < GAMEPADS; slot++)
+			live = live || m_pad_addr[slot] == address;
+		if (!live)
+			continue;
+		out.device_count++;
+		out.last_device_addr = address;
+		bool pad = false;
+		for (unsigned slot = 0; slot < GAMEPADS; slot++)
+			pad = pad || m_pad_addr[slot] == address;
+		out.last_device_vid = pad ? F310_VID : 0xffff;
+		out.last_device_pid = pad ? F310_PID : 0xffff;
+	}
+	out.mount_count = m_mount_count;
+	out.unmount_count = m_unmount_count;
+	out.hid_mount_count = m_hid_mounts;
+	out.last_hid_addr = m_last_hid_addr;
+	out.last_hid_protocol = m_last_hid_proto;
+	for (unsigned slot = 0; slot < GAMEPADS; slot++)
+	{
+		out.gamepad_addr[slot] = m_pad_addr[slot];
+		out.gamepad_instance[slot] = 0;
+		out.gamepad_first_arm[slot] = m_pad_first_arm[slot];
+		out.gamepad_reports[slot] = m_pad_reports[slot];
+		out.gamepad_last_len[slot] = m_pad_last_len[slot];
+		out.gamepad_latch[slot] = m_latch.value(slot);
+	}
+	out.other_addr = m_other_addr;
+	out.other_instance = m_other_addr != 0 ? MOUSE_INSTANCE : 0;
+	out.other_reports = m_other_reports;
+	out.other_last_len = m_other_last_len;
+	out.other_last = m_other_last;
+	out.mouse_x = m_mouse_x;
+	out.mouse_y = m_mouse_y;
+	out.mouse_wheel = m_mouse_wheel;
+	out.mouse_buttons = m_mouse_buttons;
 }

@@ -8,7 +8,9 @@
 #include "zephyr80_ioc_core.h"
 #include "zephyr80_ioc_lane.h"
 #include "zephyr80_ioc_speed.h"
+#include "zephyr80_usb_gamepad.h"
 #include "zephyr80_usb_keyboard.h"
+#include "zephyr80_usb_mouse.h"
 
 // The IO controller as the Z80 sees it through SIO1: a behavioural model of
 // the firmware's transport (Code/MCU/IOController src/main.c,
@@ -50,6 +52,16 @@
 // reset; a held key's repeat runs at the first idle pass on or after its due
 // tick.  Ctrl+Alt+Esc drops READY and resets the machine (handler_reset).
 //
+// USB mouse and gamepads (the `mouse` and `pad1`, `pad2` subdevices,
+// zephyr80_usb_mouse, zephyr80_usb_gamepad): the idle pass also mounts or
+// unmounts each as its configuration says, polls the mouse until it has
+// nothing to report and each mounted pad when its 10 ms poll is due (the
+// pad's report is its state at that instant), and feeds the reports to the
+// HID module.  A mouse or pad that changes while a service runs is taken at
+// the service's end; the pads' poll timer is the repeat's.  The controller
+// latches the pads and the keyboard's number keys drive are read through
+// controller().
+//
 // Timing is a short table of named delays (zephyr80_ioc.cpp); command
 // processing itself takes no emulated time.
 //
@@ -67,7 +79,8 @@
 // All state is save-registered and the scheduler saves the timer, so a state
 // saved mid-transfer resumes it.  A reset cancels the timer and every phase.
 class zephyr80_ioc_device : public device_t, public zephyr80_ioc_lane_client, private zephyr80_ioc_core::link,
-	private zephyr80_usb_keyboard_device::host
+	private zephyr80_usb_keyboard_device::host, private zephyr80_usb_mouse_device::host,
+	private zephyr80_usb_gamepad_device::host
 {
 public:
 	zephyr80_ioc_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
@@ -81,6 +94,9 @@ public:
 	// zephyr80_ioc_lane_client
 	virtual void lane_rts_changed(zephyr80_ioc_lane lane, bool asserted) override;
 	virtual void lane_data_event(zephyr80_ioc_lane lane) override;
+
+	// The byte controller latch `port` (0 or 1) presents on a read of E0h-FFh.
+	u8 controller(unsigned port) const { return m_core.hid().latch().value(port); }
 
 protected:
 	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
@@ -112,9 +128,13 @@ private:
 	// zephyr80_usb_keyboard_device::host
 	virtual void keyboard_report(u8 const *report, unsigned length) override;
 
+	// zephyr80_usb_mouse_device::host, zephyr80_usb_gamepad_device::host
+	virtual void usb_input_ready() override;
+
 	TIMER_CALLBACK_MEMBER(command_step);
 	TIMER_CALLBACK_MEMBER(hid_tick);
 	void hid_service();
+	void usb_sync(u32 now);
 	u32 hid_now_ms() const;
 	void poll_request();
 	void serve();
@@ -133,6 +153,8 @@ private:
 	bool m_fast;           // -ioc_speed fast
 	zephyr80_ioc_core m_core;
 	required_device<zephyr80_usb_keyboard_device> m_keyboard;
+	required_device<zephyr80_usb_mouse_device> m_mouse;
+	required_device_array<zephyr80_usb_gamepad_device, zephyr80_ioc_hid::GAMEPADS> m_pads;
 	emu_timer *m_command_timer;
 	emu_timer *m_hid_timer;  // the repeat's due tick
 
@@ -153,6 +175,7 @@ private:
 	attotime m_hid_epoch;  // the controller's reset: its millisecond clock's zero
 	u8 m_kbd_report[zephyr80_usb_keyboard_device::REPORT]; // a report waiting for the idle pass
 	bool m_kbd_pending;
+	u8 m_pad_slot[zephyr80_ioc_hid::GAMEPADS]; // the HID module's slot each pad took, or GAMEPAD_NONE
 };
 
 DECLARE_DEVICE_TYPE(ZEPHYR80_IOC, zephyr80_ioc_device)

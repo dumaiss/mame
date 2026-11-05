@@ -551,8 +551,6 @@ void zephyr80_ioc_core::reset()
 	m_generation = 1;
 
 	m_hid.reset();
-	m_mouse_flags = m_mouse_buttons = m_mouse_pressed = 0;
-	m_mouse_dx = m_mouse_dy = m_mouse_wheel = 0;
 }
 
 u16 zephyr80_ioc_core::crc16(u16 crc, u8 data)
@@ -2075,33 +2073,55 @@ void zephyr80_ioc_core::fs2_truncate(frame const &request, frame &reply)
 // ran: HID_HOST_NOT_STARTED, revision 0, /USB_INT idle.  The live USB fields
 // (hid_host_usb_state) describe the HID module's keyboard: one device at
 // its address, the reports received since the mount, the last report and
-// full speed; with no keyboard mounted, none, 0 and speed FFh.
+// full speed; with no keyboard mounted, none, 0 and speed FFh.  Pages 6 and
+// 7 are the module's live state (hid_host_gamepad_state): the mounted
+// devices, each pad slot with its latch byte, and the second interface with
+// its raw report and the mouse's running totals.
 void zephyr80_ioc_core::hid_status(frame const &request, frame &reply) const
 {
 	u8 const page = request[IOC_OFF_HID_REQ_PAGE];
-	if (page == IOC_HID_PAGE_GAMEPAD)
+	if (page == IOC_HID_PAGE_GAMEPAD || page == IOC_HID_PAGE_OTHER)
 	{
-		// hid_host_gamepad_state with no device: FFh sentinels, the latch idle.
+		zephyr80_ioc_hid::gamepad_state state;
+		m_hid.state(state);
+		if (page == IOC_HID_PAGE_OTHER)
+		{
+			reply_init(request, reply, RSP_HID_STATUS, IOC_STATUS_OK, IOC_HID_OTHER_PAYLOAD_LEN);
+			u8 *p = &reply[OFF_PAYLOAD];
+			p[0] = IOC_HID_PAGE_OTHER;
+			p[1] = state.other_addr;
+			p[2] = state.other_instance;
+			put16(p + 3, state.other_reports);
+			p[5] = state.other_last_len;
+			std::copy(state.other_last.begin(), state.other_last.end(), p + 6);
+			p[14] = state.mouse_buttons;
+			put16(p + 15, state.mouse_x);
+			put16(p + 17, state.mouse_y);
+			put16(p + 19, state.mouse_wheel);
+			return;
+		}
 		reply_init(request, reply, RSP_HID_STATUS, IOC_STATUS_OK, IOC_HID_GAMEPAD_PAYLOAD_LEN);
 		u8 *p = &reply[OFF_PAYLOAD];
 		p[0] = IOC_HID_PAGE_GAMEPAD;
-		p[4] = 0xff;                     // LAST_ADDR
-		put16(p + 5, 0xffff);            // LAST_VID
-		put16(p + 7, 0xffff);            // LAST_PID
-		p[10] = 0xff;                    // LAST_HID_ADDR
-		for (unsigned pad = 0; pad < 2; pad++)
+		p[1] = state.device_count;
+		p[2] = state.mount_count;
+		p[3] = state.unmount_count;
+		p[4] = state.last_device_addr;
+		put16(p + 5, state.last_device_vid);
+		put16(p + 7, state.last_device_pid);
+		p[9] = state.hid_mount_count;
+		p[10] = state.last_hid_addr;
+		for (unsigned pad = 0; pad < zephyr80_ioc_hid::GAMEPADS; pad++)
 		{
-			p[11 + pad * 7 + 2] = 0xff;  // first arm: never
-			p[11 + pad * 7 + 6] = 0x7f;  // CONTROLLER_LATCH_IDLE
+			u8 *q = p + 11 + pad * 7;
+			q[0] = state.gamepad_addr[pad];
+			q[1] = state.gamepad_instance[pad];
+			q[2] = state.gamepad_first_arm[pad];
+			put16(q + 3, state.gamepad_reports[pad]);
+			q[5] = state.gamepad_last_len[pad];
+			q[6] = state.gamepad_latch[pad];
 		}
-		p[25] = 0xff;                    // LAST_HID_PROTO
-		return;
-	}
-	if (page == IOC_HID_PAGE_OTHER)
-	{
-		reply_init(request, reply, RSP_HID_STATUS, IOC_STATUS_OK, IOC_HID_OTHER_PAYLOAD_LEN);
-		reply[OFF_PAYLOAD] = IOC_HID_PAGE_OTHER;
-		reply[OFF_PAYLOAD + 14] = m_mouse_buttons;
+		p[25] = state.last_hid_protocol;
 		return;
 	}
 	reply_init(request, reply, RSP_HID_STATUS, IOC_STATUS_OK, IOC_HID_STATUS_PAYLOAD_LEN);
@@ -2126,17 +2146,17 @@ void zephyr80_ioc_core::hid_input(frame const &request, frame &reply)
 	reply[OFF_PAYLOAD + 1] = m_hid.dropped();
 }
 
-// handler_hid_mouse / hid_mouse_take: motion and presses since the last
-// read, then cleared.  No mouse is mounted until a device supplies one.
+// handler_hid_mouse / hid_mouse_take: flags, the buttons held, the buttons
+// pressed and the motion since the last read, then those cleared.  Flags are
+// zero with no mouse mounted, and the reads are all zero.
 void zephyr80_ioc_core::hid_mouse(frame const &request, frame &reply)
 {
+	zephyr80_ioc_hid::mouse_read const mouse = m_hid.mouse_take();
 	reply_init(request, reply, RSP_HID_MOUSE, IOC_STATUS_OK, IOC_HID_MOUSE_PAYLOAD_LEN);
-	reply[OFF_PAYLOAD + 0] = m_mouse_flags;
-	reply[OFF_PAYLOAD + 1] = m_mouse_buttons;
-	reply[OFF_PAYLOAD + 2] = m_mouse_pressed;
-	put16(&reply[OFF_PAYLOAD + 3], u16(m_mouse_dx));
-	put16(&reply[OFF_PAYLOAD + 5], u16(m_mouse_dy));
-	put16(&reply[OFF_PAYLOAD + 7], u16(m_mouse_wheel));
-	m_mouse_pressed = 0;
-	m_mouse_dx = m_mouse_dy = m_mouse_wheel = 0;
+	reply[OFF_PAYLOAD + 0] = mouse.flags;
+	reply[OFF_PAYLOAD + 1] = mouse.buttons;
+	reply[OFF_PAYLOAD + 2] = mouse.pressed;
+	put16(&reply[OFF_PAYLOAD + 3], u16(mouse.dx));
+	put16(&reply[OFF_PAYLOAD + 5], u16(mouse.dy));
+	put16(&reply[OFF_PAYLOAD + 7], u16(mouse.wheel));
 }

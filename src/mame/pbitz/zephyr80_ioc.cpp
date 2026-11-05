@@ -83,9 +83,12 @@ zephyr80_ioc_device::zephyr80_ioc_device(const machine_config &mconfig, const ch
 	, m_fast(false)
 	, m_core(*this)
 	, m_keyboard(*this, "keyboard")
+	, m_mouse(*this, "mouse")
+	, m_pads(*this, "pad%u", 1U)
 	, m_command_timer(nullptr)
 	, m_hid_timer(nullptr)
 	, m_kbd_pending(false)
+	, m_pad_slot{ zephyr80_ioc_hid::GAMEPAD_NONE, zephyr80_ioc_hid::GAMEPAD_NONE }
 {
 }
 
@@ -93,6 +96,14 @@ void zephyr80_ioc_device::device_add_mconfig(machine_config &config)
 {
 	ZEPHYR80_USB_KEYBOARD(config, m_keyboard);
 	m_keyboard->set_host(*this);
+	ZEPHYR80_USB_MOUSE(config, m_mouse);
+	m_mouse->set_host(*this);
+	for (unsigned pad = 0; pad < zephyr80_ioc_hid::GAMEPADS; pad++)
+	{
+		ZEPHYR80_USB_GAMEPAD(config, m_pads[pad]);
+		m_pads[pad]->set_number(pad);
+		m_pads[pad]->set_host(*this);
+	}
 }
 
 void zephyr80_ioc_device::device_start()
@@ -125,6 +136,7 @@ void zephyr80_ioc_device::device_start()
 	save_item(NAME(m_hid_epoch));
 	save_item(NAME(m_kbd_report));
 	save_item(NAME(m_kbd_pending));
+	save_item(NAME(m_pad_slot));
 }
 
 // The controller restarts with the board: no service in flight, both /SYNC
@@ -151,6 +163,7 @@ void zephyr80_ioc_device::device_reset()
 	m_hid_timer->adjust(attotime::never);
 	std::fill(std::begin(m_kbd_report), std::end(m_kbd_report), 0);
 	m_kbd_pending = false;
+	std::fill(std::begin(m_pad_slot), std::end(m_pad_slot), zephyr80_ioc_hid::GAMEPAD_NONE);
 	resync_lanes();
 	m_lane->lane_cts(COMMAND, false);
 	m_lane->lane_dcd(BULK, false);
@@ -197,8 +210,59 @@ u32 zephyr80_ioc_device::hid_now_ms() const
 	return u32((machine().time() - m_hid_epoch).as_ticks(1000 / zephyr80_ioc_hid::TICK_MS)) * zephyr80_ioc_hid::TICK_MS;
 }
 
-// hid_host_task in the idle pass: the waiting report (tuh_task), the repeat,
-// then hid_reset_requested.  The timer is set for the repeat's due tick.
+// A mouse or pad changed (a motion, a button, a connection).
+void zephyr80_ioc_device::usb_input_ready()
+{
+	if (m_phase == IDLE)
+		hid_service();
+}
+
+// The devices the host sees: each mouse or pad whose connection changed at its
+// last scan is mounted or unmounted (tuh_hid_mount_cb, tuh_umount_cb), the mouse is polled
+// until it has nothing to report, and each mounted pad whose 10 ms poll has
+// come reports its state.
+void zephyr80_ioc_device::usb_sync(u32 now)
+{
+	zephyr80_ioc_hid &hid = m_core.hid();
+	if (m_mouse->attached() != hid.mouse_mounted())
+	{
+		if (m_mouse->attached())
+			hid.mount_mouse();
+		else
+			hid.unmount_mouse();
+	}
+	u8 report[zephyr80_usb_gamepad_device::REPORT];
+	for (unsigned pad = 0; pad < zephyr80_ioc_hid::GAMEPADS; pad++)
+	{
+		u8 &slot = m_pad_slot[pad];
+		if (m_pads[pad]->attached() && slot == zephyr80_ioc_hid::GAMEPAD_NONE)
+		{
+			u8 address;
+			slot = hid.mount_pad(address);
+		}
+		else if (!m_pads[pad]->attached() && slot != zephyr80_ioc_hid::GAMEPAD_NONE)
+		{
+			hid.unmount_pad(slot);
+			slot = zephyr80_ioc_hid::GAMEPAD_NONE;
+		}
+	}
+	u8 mouse[zephyr80_usb_mouse_device::REPORT];
+	while (hid.mouse_mounted() && m_mouse->poll(mouse))
+		hid.mouse_report(mouse, std::size(mouse));
+	for (unsigned pad = 0; pad < zephyr80_ioc_hid::GAMEPADS; pad++)
+	{
+		u8 const slot = m_pad_slot[pad];
+		if (slot != zephyr80_ioc_hid::GAMEPAD_NONE && hid.gamepad_due(slot, now))
+		{
+			m_pads[pad]->report(report);
+			hid.gamepad_report(slot, report, std::size(report), now);
+		}
+	}
+}
+
+// hid_host_task in the idle pass: the waiting report (tuh_task), the devices,
+// the repeat, then hid_reset_requested.  The timer is set for the next due
+// tick, the repeat's or a pad's poll.
 void zephyr80_ioc_device::hid_service()
 {
 	zephyr80_ioc_hid &hid = m_core.hid();
@@ -208,6 +272,7 @@ void zephyr80_ioc_device::hid_service()
 		m_kbd_pending = false;
 		hid.report(m_kbd_report, std::size(m_kbd_report), now);
 	}
+	usb_sync(now);
 	hid.task(now);
 	if (hid.reset_requested())
 	{
@@ -216,8 +281,15 @@ void zephyr80_ioc_device::hid_service()
 		host_reset();
 		return;
 	}
-	u32 due;
-	if (hid.repeat_due(due))
+	u32 due = 0;
+	bool have = hid.repeat_due(due);
+	u32 pad_due;
+	if (hid.gamepad_next_due(pad_due) && (!have || s32(pad_due - due) < 0))
+	{
+		due = pad_due;
+		have = true;
+	}
+	if (have)
 	{
 		attotime const at = m_hid_epoch + attotime::from_msec(due);
 		m_hid_timer->adjust(at > machine().time() ? at - machine().time() : attotime::zero);

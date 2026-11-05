@@ -73,6 +73,7 @@ function createProjects_mame_pbitz(_target, _subtarget)
 		MAME_DIR .. "src/mame/pbitz/zephyr80_map.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_flash.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_controller_latch.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_ioc_core.cpp",
@@ -87,6 +88,10 @@ function createProjects_mame_pbitz(_target, _subtarget)
 		MAME_DIR .. "src/mame/pbitz/zephyr80_sio1.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_keyboard.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_keyboard.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_mouse.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_mouse.h",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_gamepad.cpp",
+		MAME_DIR .. "src/mame/pbitz/zephyr80_usb_gamepad.h",
 		MAME_DIR .. "src/mame/pbitz/zephyr_banktst.cpp",
 		MAME_DIR .. "src/mame/pbitz/zephyr_siotop.cpp",
 	}

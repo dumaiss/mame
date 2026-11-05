@@ -42,6 +42,19 @@ static constexpr u8 SOUND_CTRL_END = 0xff;
 static constexpr u8 SOUND_PORT_MASK = 0x07;
 static constexpr u8 SOUND_PSG_COUNT = 4;
 static constexpr u8 SOUND_DAC_PORT = 4;
+// Controller latches (CTRL, reads of E0h-FFh): on the IO board a 74HC138 (U6,
+// /CE_CTRL on E0, /RD on E1) with only its A0 input wired to the bus (bus A0;
+// A1 and A2 are tied to ground), so Y0 enables pad 0's 595 and Y1 pad 1's:
+// bus A0 low reads pad 0, high pad 1, and every other address line is ignored.
+// The ports guests use, FCh (pad 0) and FFh (pad 1), agree with the
+// ColecoVision decode (A1) as well.
+static constexpr u8 CONTROLLER_SELECT_MASK = 0x01;
+
+constexpr unsigned controller_port(u8 offset)
+{
+	return offset & CONTROLLER_SELECT_MASK;
+}
+
 // Scheduler trigger the stretched PSG write waits on.
 static constexpr int SOUND_READY_TRIGGER = 0x5e11;
 
@@ -137,6 +150,7 @@ constexpr mapping decode(u16 address, u8 value)
 }
 
 static_assert(mem::RAM_SIZE == 512 * 1024 && mem::ROM_SIZE == 512 * 1024);
+static_assert(io::controller_port(0xfc - io::SOUND_CTRL_START) == 0 && io::controller_port(0xff - io::SOUND_CTRL_START) == 1);
 static_assert(io::ctc_channel(0) == 0 && io::ctc_channel(1) == 2 && io::ctc_channel(2) == 1 && io::ctc_channel(3) == 3);
 static_assert(!io::vdp_config_select(0x03) && io::vdp_config_select(0x04) && io::vdp_config_select(0x07) && !io::vdp_config_select(0x18) && io::vdp_config_select(0x1c));
 

@@ -284,14 +284,8 @@ private:
 	u8 m_resolver_components;
 	u32 m_generation;
 
-	// HID (ioc_hid.c): the keyboard and its input queue; the mouse read state
+	// HID (ioc_hid.c): the keyboard and its input queue, the mouse, the pads
 	zephyr80_ioc_hid m_hid;
-	u8 m_mouse_flags;
-	u8 m_mouse_buttons;
-	u8 m_mouse_pressed;
-	s16 m_mouse_dx;
-	s16 m_mouse_dy;
-	s16 m_mouse_wheel;
 };
 
 template <typename Save>
@@ -354,12 +348,6 @@ void zephyr80_ioc_core::save_state(Save &&save)
 	save(m_resolver_components, "core.m_resolver_components");
 	save(m_generation, "core.m_generation");
 	m_hid.save_state(save);
-	save(m_mouse_flags, "core.m_mouse_flags");
-	save(m_mouse_buttons, "core.m_mouse_buttons");
-	save(m_mouse_pressed, "core.m_mouse_pressed");
-	save(m_mouse_dx, "core.m_mouse_dx");
-	save(m_mouse_dy, "core.m_mouse_dy");
-	save(m_mouse_wheel, "core.m_mouse_wheel");
 }
 
 #endif // MAME_PBITZ_ZEPHYR80_IOC_CORE_H
