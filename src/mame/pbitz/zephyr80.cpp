@@ -534,4 +534,4 @@ ROM_END
 
 
 COMP(2026, zephyr80, 0, 0, zephyr80, 0, zephyr80_state, empty_init,
-	"Kitamura", "Zephyr-80 prototype decode shell", MACHINE_NOT_WORKING)
+	"Kitamura", "Zephyr-80", MACHINE_SUPPORTS_SAVE)
